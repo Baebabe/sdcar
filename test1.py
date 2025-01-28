@@ -17,6 +17,10 @@ from torch.utils.tensorboard import SummaryWriter
 from threading import Thread
 from tqdm import tqdm
 import requests 
+import pygame
+from pygame import surfarray
+import traceback
+
 def download_weights(url, save_path):
     """Download weights if they don't exist"""
     if not os.path.exists(save_path):
@@ -53,9 +57,9 @@ except ImportError:
 # Constants
 IM_WIDTH = 640
 IM_HEIGHT = 480
-EPISODES = 200
-SECONDS_PER_EPISODE = 30
-BATCH_SIZE = 64
+EPISODES = 100
+SECONDS_PER_EPISODE = 60
+BATCH_SIZE = 32
 LEARNING_RATE = 3e-4
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
@@ -281,30 +285,23 @@ class PPOAgent:
         self.memory.clear()
 
 
-    def save_checkpoint(self, episode):
+    def save_checkpoint(self, episode, filepath, best_reward=None):
         """Save model checkpoint"""
         try:
-            checkpoint_path = os.path.join(self.checkpoint_dir, f'checkpoint_{episode}.pth')
-            latest_path = os.path.join(self.checkpoint_dir, 'latest.pth')
-            
             checkpoint = {
                 'episode': episode,
                 'actor_critic_state_dict': self.actor_critic.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
-                'best_reward': self.best_reward,
+                'best_reward': best_reward if best_reward is not None else self.best_reward,
                 'training_step': self.training_step
             }
-            
-            # Save episode-specific checkpoint
-            torch.save(checkpoint, checkpoint_path)
-            
-            # Save as latest checkpoint
-            torch.save(checkpoint, latest_path)
-            
-            print(f"Checkpoint saved: {checkpoint_path}")
-            
+
+            torch.save(checkpoint, filepath)
+            print(f"Checkpoint saved: {filepath}")
+
         except Exception as e:
             print(f"Error saving checkpoint: {e}")
+            traceback.print_exc()
     
     def load_checkpoint(self, checkpoint_path, mode='train'):
         """Load model checkpoint"""
@@ -359,6 +356,12 @@ class CarEnv:
         self.pedestrians = []
         self.pedestrian_controllers = []
         
+
+        pygame.init()
+        self.display = None
+        self.clock = None
+        self.init_pygame_display()
+
         # Camera settings
         self.camera_transform = carla.Transform(
             carla.Location(x=1.6, z=1.7),
@@ -371,51 +374,114 @@ class CarEnv:
         # Initialize YOLO model
         self._init_yolo()
 
+    def init_pygame_display(self):
+        """Initialize pygame display with error handling"""
+        try:
+            if self.display is None:
+                pygame.init()
+                self.display = pygame.display.set_mode((IM_WIDTH, IM_HEIGHT))
+                pygame.display.set_caption("CARLA + YOLO View")
+                self.clock = pygame.time.Clock()
+        except Exception as e:
+            print(f"Error initializing pygame display: {e}")
+            traceback.print_exc()
+
     def _process_image(self, weak_self, image):
-        """Process camera image"""
         self = weak_self()
         if self is not None:
-            array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
-            array = np.reshape(array, (image.height, image.width, 4))
-            self.front_camera = array[:, :, :3]
+            try:
+                array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
+                array = np.reshape(array, (image.height, image.width, 4))
+                array = array[:, :, :3]  # Remove alpha channel
+                self.front_camera = array
 
-    # In the CarEnv class, modify the reset method to include NPC spawning:
+                # Process YOLO detection with proper scaling
+                detections = self.process_yolo_detection(array)
+
+                # Create pygame surface
+                surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+
+                # Draw detections with proper scaling
+                for obj in detections:
+                    # Get original image coordinates
+                    x1 = int(obj['position'][0] - obj['bbox_width']/2)
+                    y1 = int(obj['position'][1] - obj['bbox_height']/2)
+                    x2 = int(obj['position'][0] + obj['bbox_width']/2)
+                    y2 = int(obj['position'][1] + obj['bbox_height']/2)
+
+                    # Scale coordinates to match display size
+                    x1 = int(x1 * IM_WIDTH / 640)
+                    y1 = int(y1 * IM_HEIGHT / 640)
+                    x2 = int(x2 * IM_WIDTH / 640)
+                    y2 = int(y2 * IM_HEIGHT / 640)
+
+                    # Draw rectangle
+                    pygame.draw.rect(surface, (0, 255, 0), (x1, y1, x2-x1, y2-y1), 2)
+
+                    # Draw label
+                    if pygame.font.get_init():
+                        font = pygame.font.Font(None, 24)
+                        label = f"{obj['class_name']} {obj['depth']:.1f}m"
+                        text = font.render(label, True, (255, 255, 255))
+                        surface.blit(text, (x1, y1-20))
+
+                # Update display
+                if self.display is not None:
+                    self.display.blit(surface, (0, 0))
+                    pygame.display.flip()
+
+            except Exception as e:
+                print(f"Error in image processing: {e}")
+                traceback.print_exc()
 
     def reset(self):
-        """Reset environment"""
+        """Reset environment with movement verification"""
         print("Starting environment reset...")
-
-        # Clean up existing actors
         self.cleanup_actors()
-        self.cleanup_npcs()  # Add this line
-
-        # Clear history and reset camera
-        self.collision_hist.clear()
-        self.front_camera = None
-
-        # Reset state variables
-        self.last_location = None
-        self.stuck_time = 0
-        self.episode_start = time.time()
+        self.cleanup_npcs()
 
         # Setup new episode
-        print("Setting up vehicle...")
         if not self.setup_vehicle():
             raise Exception("Failed to setup vehicle")
 
-        # Spawn NPCs - Add this line
+        # Spawn NPCs
         self.spawn_npcs()
 
-        # Wait for first observation with timeout
-        print("Waiting for camera initialization...")
-        timeout = time.time() + 10.0  # 10 seconds timeout
+        # Verify vehicle movement
+        print("Verifying vehicle movement...")
+        initial_location = self.vehicle.get_location()
+
+        # Apply forward movement
+        control = carla.VehicleControl(throttle=0.5, steer=0.0)
+        self.vehicle.apply_control(control)
+
+        # Tick world several times
+        for _ in range(20):
+            self.world.tick()
+            time.sleep(0.05)
+
+        # Check if vehicle moved
+        final_location = self.vehicle.get_location()
+        distance_moved = initial_location.distance(final_location)
+
+        if distance_moved < 0.1:
+            print("Warning: Vehicle not moving! Attempting to fix...")
+            # Try to toggle autopilot
+            self.vehicle.set_autopilot(True)
+            time.sleep(0.1)
+            self.vehicle.set_autopilot(False)
+
+        # Reset control
+        self.vehicle.apply_control(carla.VehicleControl())
+
+        # Wait for camera initialization
+        timeout = time.time() + 10.0
         while self.front_camera is None:
             if time.time() > timeout:
                 raise Exception("Timeout waiting for camera initialization")
             self.world.tick()
             time.sleep(0.1)
 
-        print("Reset completed successfully")
         return self.get_state()
 
     def setup_vehicle(self):
@@ -530,24 +596,26 @@ class CarEnv:
         try:
             print("Connecting to CARLA server...")
             self.client = carla.Client('localhost', 2000)
-            self.client.set_timeout(20.0)  # Increased timeout
+            self.client.set_timeout(20.0)
             
             print("Getting world...")
             self.world = self.client.get_world()
             
-            # Set synchronous mode
+            # Set up traffic manager
+            self.traffic_manager = self.client.get_trafficmanager(8000)
+            self.traffic_manager.set_synchronous_mode(True)
+            self.traffic_manager.set_global_distance_to_leading_vehicle(2.5)
+            self.traffic_manager.global_percentage_speed_difference(10.0)
+            
+            # Set synchronous mode settings
             settings = self.world.get_settings()
             settings.synchronous_mode = True
-            settings.fixed_delta_seconds = 0.05
+            settings.fixed_delta_seconds = 0.05  # 20 FPS
             self.world.apply_settings(settings)
             
-            # Set weather
-            weather = carla.WeatherParameters(
-                cloudiness=10.0,
-                precipitation=0.0,
-                sun_altitude_angle=90.0
-            )
-            self.world.set_weather(weather)
+            # Wait for the world to stabilize
+            for _ in range(10):
+                self.world.tick()
             
             print("CARLA world setup completed successfully")
             
@@ -717,7 +785,7 @@ class CarEnv:
             vehicle_state['steering']              # steering already normalized
         ])
 
-        return np.array(state_array, dtype=np.float32)
+        return np.array(state_array, dtype=np.float16)
     
     def calculate_reward(self):
         """
@@ -755,7 +823,7 @@ class CarEnv:
 
         if speed < 2.0:
             self.stuck_time += 0.1
-            if self.stuck_time > 3.0:
+            if self.stuck_time > 20.0:
                 return STUCK_PENALTY, True, {'termination_reason': 'stuck'}
         else:
             self.stuck_time = 0
@@ -820,15 +888,15 @@ class CarEnv:
     def step(self, action):
         """Execute action and return new state, reward, done, and info"""
         try:
-            # Normalize actions to proper range
+            # Modified control logic for better movement
             steer = float(np.clip(action[0], -1.0, 1.0))
-            throttle = float(np.clip(action[1], 0.0, 1.0))  # Throttle should be positive
+            throttle = float(np.clip(action[1], 0.0, 1.0))
 
             # Apply control with more realistic values
             control = carla.VehicleControl(
                 throttle=throttle,
                 steer=steer,
-                brake=0.0,  # Add brake control if needed
+                brake=0.0,  # Set to 0 initially to ensure movement
                 hand_brake=False,
                 reverse=False,
                 manual_gear_shift=False
@@ -836,8 +904,15 @@ class CarEnv:
 
             self.vehicle.apply_control(control)
 
-            # Ensure the world ticks
+            # Only tick the world - Traffic Manager updates automatically
             self.world.tick()
+
+            # Handle pygame events and display update
+            if self.display is not None:
+                self.clock.tick(20)  # Limit to 20 FPS
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        return None, 0, True, {'termination_reason': 'user_quit'}
 
             # Get new state
             new_state = self.get_state()
@@ -850,96 +925,152 @@ class CarEnv:
                 done = True
                 info['termination_reason'] = 'timeout'
 
-            # Add debug information
-            if hasattr(self, 'vehicle'):
-                velocity = self.vehicle.get_velocity()
-                speed = 3.6 * math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)  # km/h
-                info['speed'] = speed
-                info['control'] = {'throttle': throttle, 'steer': steer}
-
             return new_state, reward, done, info
 
         except Exception as e:
             print(f"Error in step: {e}")
-            import traceback
             traceback.print_exc()
             return None, 0, True, {'error': str(e)}
     
 
 
     def spawn_npcs(self):
-        """Spawn NPC vehicles and pedestrians"""
+        """Spawn NPC vehicles near the training vehicle"""
         try:
-            # Reduced numbers for better performance
-            number_of_vehicles = 10  # Reduced from 30
-            number_of_pedestrians = 10  # Reduced from 50
+            number_of_vehicles = 5
+            spawn_radius = 40.0  # Radius in meters to spawn NPCs around training vehicle
 
-            # Get spawn points
-            spawn_points = self.world.get_map().get_spawn_points()
-
-            if not spawn_points:
-                print("No spawn points found!")
+            if self.vehicle is None:
+                print("Training vehicle not found! Cannot spawn NPCs.")
                 return
 
-            # Spawn NPC vehicles
-            print(f"Attempting to spawn {number_of_vehicles} vehicles...")
+            # Get training vehicle's location
+            vehicle_location = self.vehicle.get_location()
+
+            # Configure traffic manager
+            traffic_manager = self.client.get_trafficmanager()
+            traffic_manager.set_synchronous_mode(True)
+            traffic_manager.set_global_distance_to_leading_vehicle(2.5)
+            traffic_manager.global_percentage_speed_difference(10.0)
+
+            # Get all spawn points
+            all_spawn_points = self.world.get_map().get_spawn_points()
+
+            # Filter spawn points to only include those within radius of training vehicle
+            nearby_spawn_points = []
+            for spawn_point in all_spawn_points:
+                if spawn_point.location.distance(vehicle_location) <= spawn_radius:
+                    nearby_spawn_points.append(spawn_point)
+
+            if not nearby_spawn_points:
+                print(f"No spawn points found within {spawn_radius}m of training vehicle!")
+                # Fallback to closest spawn points if none found in radius
+                all_spawn_points.sort(key=lambda p: p.location.distance(vehicle_location))
+                nearby_spawn_points = all_spawn_points[:number_of_vehicles]
+
+            print(f"Found {len(nearby_spawn_points)} potential spawn points near training vehicle")
+
+            # Spawn vehicles
             vehicle_bps = self.world.get_blueprint_library().filter('vehicle.*')
             vehicle_bps = [bp for bp in vehicle_bps if int(bp.get_attribute('number_of_wheels')) == 4]
 
-            # Ensure we don't try to spawn more vehicles than spawn points
-            number_of_vehicles = min(number_of_vehicles, len(spawn_points))
-            vehicle_spawn_points = random.sample(spawn_points, number_of_vehicles)
+            # Try to spawn vehicles at nearby points
+            spawned_count = 0
+            for spawn_point in nearby_spawn_points:
+                if spawned_count >= number_of_vehicles:
+                    break
 
-            # Spawn vehicles
-            for spawn_point in vehicle_spawn_points:
                 blueprint = random.choice(vehicle_bps)
+
+                # Set color for better visibility
                 if blueprint.has_attribute('color'):
                     color = random.choice(blueprint.get_attribute('color').recommended_values)
                     blueprint.set_attribute('color', color)
 
+                # Try to spawn vehicle
                 vehicle = self.world.try_spawn_actor(blueprint, spawn_point)
+
                 if vehicle is not None:
-                    vehicle.set_autopilot(True)
                     self.npc_vehicles.append(vehicle)
-                    print(f"Spawned vehicle: {vehicle.type_id}")
+                    vehicle.set_autopilot(True)
 
-            # Spawn pedestrians
-            print(f"Attempting to spawn {number_of_pedestrians} pedestrians...")
-            pedestrian_spawn_points = []
+                    try:
+                        # Set more conservative speed for nearby vehicles
+                        traffic_manager.vehicle_percentage_speed_difference(vehicle, random.uniform(-10, 0))
+                        traffic_manager.distance_to_leading_vehicle(vehicle, random.uniform(2.0, 4.0))
 
-            # Get valid spawn points for pedestrians
-            for _ in range(number_of_pedestrians):
-                location = self.world.get_random_location_from_navigation()
-                if location is not None:
-                    pedestrian_spawn_points.append(carla.Transform(location))
+                        spawned_count += 1
 
-            # Spawn pedestrians
-            walker_bp = self.world.get_blueprint_library().filter('walker.pedestrian.*')
-            for spawn_point in pedestrian_spawn_points:
-                blueprint = random.choice(walker_bp)
-                if blueprint.has_attribute('is_invincible'):
-                    blueprint.set_attribute('is_invincible', 'false')
+                        # Print spawn information
+                        distance_to_ego = vehicle.get_location().distance(vehicle_location)
+                        print(f"Spawned {vehicle.type_id} at {distance_to_ego:.1f}m from training vehicle")
 
-                pedestrian = self.world.try_spawn_actor(blueprint, spawn_point)
-                if pedestrian is not None:
-                    self.pedestrians.append(pedestrian)
+                        # Draw debug line to show spawn location
+                        debug = self.world.debug
+                        if debug:
+                            # Draw a line from ego vehicle to spawned vehicle
+                            debug.draw_line(
+                                vehicle_location,
+                                vehicle.get_location(),
+                                thickness=0.1,
+                                color=carla.Color(r=0, g=255, b=0),
+                                life_time=5.0
+                            )
+                            # Draw point at spawn location
+                            debug.draw_point(
+                                vehicle.get_location(),
+                                size=0.1,
+                                color=carla.Color(r=255, g=0, b=0),
+                                life_time=5.0
+                            )
 
-                    # Spawn controller for this pedestrian
-                    controller_bp = self.world.get_blueprint_library().find('controller.ai.walker')
-                    controller = self.world.try_spawn_actor(controller_bp, carla.Transform(), pedestrian)
-                    if controller is not None:
-                        self.pedestrian_controllers.append(controller)
-                        controller.start()
-                        controller.go_to_location(self.world.get_random_location_from_navigation())
-                        controller.set_max_speed(1.4)
+                    except Exception as tm_error:
+                        print(f"Warning: Could not set some traffic manager parameters: {tm_error}")
+                        continue
 
-            print(f"Successfully spawned {len(self.npc_vehicles)} vehicles and {len(self.pedestrians)} pedestrians")
+            print(f"Successfully spawned {spawned_count} vehicles near training vehicle")
+
+            # Visualize spawn radius using points and lines
+            try:
+                debug = self.world.debug
+                if debug:
+                    # Draw points around the radius (approximating a circle)
+                    num_points = 36  # Number of points to approximate circle
+                    for i in range(num_points):
+                        angle = (2 * math.pi * i) / num_points
+                        point = carla.Location(
+                            x=vehicle_location.x + spawn_radius * math.cos(angle),
+                            y=vehicle_location.y + spawn_radius * math.sin(angle),
+                            z=vehicle_location.z
+                        )
+                        debug.draw_point(
+                            point,
+                            size=0.1,
+                            color=carla.Color(r=0, g=255, b=0),
+                            life_time=5.0
+                        )
+                        # Draw lines between points
+                        if i > 0:
+                            prev_point = carla.Location(
+                                x=vehicle_location.x + spawn_radius * math.cos((2 * math.pi * (i-1)) / num_points),
+                                y=vehicle_location.y + spawn_radius * math.sin((2 * math.pi * (i-1)) / num_points),
+                                z=vehicle_location.z
+                            )
+                            debug.draw_line(
+                                prev_point,
+                                point,
+                                thickness=0.1,
+                                color=carla.Color(r=0, g=255, b=0),
+                                life_time=5.0
+                            )
+            except Exception as debug_error:
+                print(f"Warning: Could not draw debug visualization: {debug_error}")
 
         except Exception as e:
             print(f"Error spawning NPCs: {e}")
-            import traceback
             traceback.print_exc()
             self.cleanup_npcs()
+
 
     def cleanup_npcs(self):
         """Clean up all spawned NPCs"""
@@ -951,22 +1082,36 @@ class CarEnv:
                     controller.destroy()
             self.pedestrian_controllers.clear()
 
-            # Destroy pedestrians
-            for pedestrian in self.pedestrians:
-                if pedestrian.is_alive:
-                    pedestrian.destroy()
-            self.pedestrians.clear()
-
+        
             # Destroy vehicles
             for vehicle in self.npc_vehicles:
                 if vehicle.is_alive:
                     vehicle.destroy()
             self.npc_vehicles.clear()
-
             print("Successfully cleaned up all NPCs")
 
         except Exception as e:
             print(f"Error cleaning up NPCs: {e}")
+
+    def close(self):
+        """Close environment and cleanup"""
+        try:
+            self.cleanup_actors()
+            self.cleanup_npcs()
+
+            if pygame.get_init():
+                pygame.quit()
+
+            if self.world is not None:
+                settings = self.world.get_settings()
+                settings.synchronous_mode = False
+                self.world.apply_settings(settings)
+
+            print("Environment closed successfully")
+
+        except Exception as e:
+            print(f"Error closing environment: {e}")
+            traceback.print_exc()
     
 
 
@@ -1027,12 +1172,23 @@ def evaluate(checkpoint_path, num_episodes=10):
             env.cleanup_actors()
 
 def train():
+    """Main training loop with improved monitoring and visualization"""
     print(f"Starting training at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Using device: {DEVICE}")
     
     # Create directories for saving
     os.makedirs('checkpoints', exist_ok=True)
     os.makedirs('logs', exist_ok=True)
+    os.makedirs('tensorboard_logs', exist_ok=True)
+    
+    # Initialize metrics tracking
+    training_metrics = {
+        'episode_rewards': [],
+        'episode_lengths': [],
+        'best_reward': float('-inf'),
+        'last_save_time': time.time(),
+        'total_steps': 0
+    }
     
     try:
         # Initialize environment
@@ -1044,13 +1200,14 @@ def train():
         time.sleep(2)
         
         # Calculate state dimension
-        state_dim = env.max_objects * 3 + 4  # (5 objects * 3 features) + 4 additional features
+        state_dim = env.max_objects * 3 + 4  # (max_objects * 3 features) + 4 additional features
         action_dim = 2  # steering and throttle
         print(f"State dimension: {state_dim}, Action dimension: {action_dim}")
         
         # Initialize agent
         print("Initializing PPO agent...")
         agent = PPOAgent(state_dim, action_dim)
+        writer = SummaryWriter(f'tensorboard_logs/training_{int(time.time())}')
         
         # Try to load latest checkpoint
         latest_checkpoint = os.path.join('checkpoints', 'latest.pth')
@@ -1061,10 +1218,22 @@ def train():
             if agent.load_checkpoint(latest_checkpoint):
                 checkpoint = torch.load(latest_checkpoint, map_location=DEVICE)
                 starting_episode = checkpoint.get('episode', 0) + 1
+                training_metrics['best_reward'] = checkpoint.get('best_reward', float('-inf'))
                 print(f"Resuming from episode {starting_episode}")
         
-        print("Starting training loop...")
+        print("\nStarting training loop...")
+        training_start_time = time.time()
+        
         for episode in range(starting_episode, EPISODES):
+            episode_start_time = time.time()
+            episode_metrics = {
+                'reward': 0,
+                'steps': 0,
+                'collisions': 0,
+                'avg_speed': 0,
+                'speeds': []
+            }
+            
             try:
                 print(f"\nEpisode {episode}/{EPISODES}")
                 print("Resetting environment...")
@@ -1074,14 +1243,14 @@ def train():
                     print("Failed to get initial state, retrying episode")
                     continue
                 
-                print(f"Initial state shape: {state.shape}")
-                
-                episode_reward = 0
-                episode_steps = 0
-                episode_start_time = time.time()
-                
                 # Episode loop
-                while True:
+                done = False
+                while not done:
+                    # Handle pygame events
+                    for event in pygame.event.get():
+                        if event.type == pygame.QUIT:
+                            raise KeyboardInterrupt
+                    
                     # Select action
                     action_result = agent.select_action(state)
                     if action_result is None:
@@ -1090,8 +1259,19 @@ def train():
                     
                     action, value, log_prob = action_result
                     
-                    # Execute action and get feedback
+                    # Execute action
                     next_state, reward, done, info = env.step(action)
+                    
+                    # Update metrics
+                    episode_metrics['reward'] += reward
+                    episode_metrics['steps'] += 1
+                    training_metrics['total_steps'] += 1
+                    
+                    if 'speed' in info:
+                        episode_metrics['speeds'].append(info['speed'])
+                    
+                    if 'collision' in info:
+                        episode_metrics['collisions'] += 1
                     
                     # Store experience
                     agent.memory.states.append(state)
@@ -1101,59 +1281,68 @@ def train():
                     agent.memory.log_probs.append(log_prob)
                     agent.memory.masks.append(1 - done)
                     
-                    episode_reward += reward
-                    episode_steps += 1
-                    
                     # Print progress every 100 steps
-                    if episode_steps % 100 == 0:
-                        print(f"Step {episode_steps}: Current reward = {episode_reward:.2f}")
+                    if episode_metrics['steps'] % 100 == 0:
+                        current_speed = info.get('speed', 0)
+                        print(f"Step {episode_metrics['steps']}: "
+                              f"Reward = {episode_metrics['reward']:.2f}, "
+                              f"Speed = {current_speed:.2f} km/h")
                         
-                        # Print vehicle state if available
-                        if 'speed' in info:
-                            print(f"Vehicle speed: {info['speed']:.2f} km/h")
-                        if 'control' in info:
-                            ctrl = info['control']
-                            print(f"Control: throttle={ctrl['throttle']:.2f}, steer={ctrl['steer']:.2f}")
+                        # Log to tensorboard
+                        writer.add_scalar('Training/Step_Reward', reward, training_metrics['total_steps'])
+                        writer.add_scalar('Training/Current_Speed', current_speed, training_metrics['total_steps'])
                     
-                    # Update if enough steps
+                    # Update policy if enough steps
                     if len(agent.memory.states) >= UPDATE_TIMESTEP:
-                        print(f"\nPerforming update at step {episode_steps}")
+                        print(f"\nPerforming policy update at step {episode_metrics['steps']}")
                         agent.update()
                     
                     if done:
-                        termination_reason = info.get('termination_reason', 'unknown')
-                        print(f"\nEpisode terminated due to: {termination_reason}")
                         break
                     
                     state = next_state
                 
-                # Episode completion stats
+                # Episode completion statistics
                 episode_duration = time.time() - episode_start_time
+                episode_metrics['avg_speed'] = np.mean(episode_metrics['speeds']) if episode_metrics['speeds'] else 0
+                
+                # Log episode metrics
                 print(f"\nEpisode {episode} Summary:")
-                print(f"Total Reward: {episode_reward:.2f}")
-                print(f"Total Steps: {episode_steps}")
+                print(f"Total Reward: {episode_metrics['reward']:.2f}")
+                print(f"Steps: {episode_metrics['steps']}")
+                print(f"Average Speed: {episode_metrics['avg_speed']:.2f} km/h")
+                print(f"Collisions: {episode_metrics['collisions']}")
                 print(f"Duration: {episode_duration:.2f} seconds")
-                print(f"Average Step Time: {episode_duration/episode_steps:.3f} seconds")
+                print(f"Average Step Time: {episode_duration/episode_metrics['steps']:.3f} seconds")
+                
+                # Update training metrics
+                training_metrics['episode_rewards'].append(episode_metrics['reward'])
+                training_metrics['episode_lengths'].append(episode_metrics['steps'])
                 
                 # Log to tensorboard
-                agent.writer.add_scalar('Train/Episode_Reward', episode_reward, episode)
-                agent.writer.add_scalar('Train/Episode_Length', episode_steps, episode)
-                agent.writer.add_scalar('Train/Average_Step_Time', episode_duration/episode_steps, episode)
+                writer.add_scalar('Training/Episode_Reward', episode_metrics['reward'], episode)
+                writer.add_scalar('Training/Episode_Length', episode_metrics['steps'], episode)
+                writer.add_scalar('Training/Average_Speed', episode_metrics['avg_speed'], episode)
+                writer.add_scalar('Training/Collisions', episode_metrics['collisions'], episode)
                 
-                # Update best reward and save checkpoints
-                if episode_reward > agent.best_reward:
-                    agent.best_reward = episode_reward
-                    agent.save_checkpoint(episode)
-                    print(f"New best reward: {episode_reward:.2f}")
+                # Save best model
+                if episode_metrics['reward'] > training_metrics['best_reward']:
+                    training_metrics['best_reward'] = episode_metrics['reward']
+                    best_model_path = os.path.join('checkpoints', 'best_model.pth')
+                    agent.save_checkpoint(episode, best_model_path, training_metrics['best_reward'])
+                    print(f"New best reward: {episode_metrics['reward']:.2f}")
                 
-                # Regular checkpoint saving
+                # Regular checkpoint saving (every 10 episodes)
                 if episode % 10 == 0:
-                    agent.save_checkpoint(episode)
+                    checkpoint_path = os.path.join('checkpoints', f'checkpoint_{episode}.pth')
+                    agent.save_checkpoint(episode, checkpoint_path, training_metrics['best_reward'])
                     print(f"Checkpoint saved at episode {episode}")
+                
+                # Update latest checkpoint
+                agent.save_checkpoint(episode, latest_checkpoint, training_metrics['best_reward'])
                 
             except Exception as e:
                 print(f"Error in episode {episode}: {e}")
-                import traceback
                 traceback.print_exc()
                 
                 # Try to cleanup and continue with next episode
@@ -1165,36 +1354,51 @@ def train():
                 
                 continue
                 
+        # Training completion statistics
+        total_training_time = time.time() - training_start_time
+        print("\nTraining Complete!")
+        print(f"Total training time: {total_training_time/3600:.2f} hours")
+        print(f"Best reward achieved: {training_metrics['best_reward']:.2f}")
+        print(f"Total steps: {training_metrics['total_steps']}")
+        
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")
     except Exception as e:
-        print(f"Error during training: {e}")
-        import traceback
+        print(f"Critical error during training: {e}")
         traceback.print_exc()
     finally:
         # Final cleanup
         print("\nPerforming final cleanup...")
         try:
-            # Save final checkpoint
-            if 'episode' in locals():
-                agent.save_checkpoint(episode)
+            # Save final checkpoint if not already saved
+            if 'agent' in locals() and 'episode' in locals():
+                final_checkpoint_path = os.path.join('checkpoints', 'final_model.pth')
+                agent.save_checkpoint(episode, final_checkpoint_path, training_metrics['best_reward'])
                 print("Final checkpoint saved")
             
             # Cleanup environment
-            env.cleanup_npcs()
-            env.cleanup_actors()
-            print("Environment cleaned up")
+            if 'env' in locals():
+                env.close()
+                print("Environment cleaned up")
             
             # Close tensorboard writer
-            if hasattr(agent, 'writer'):
-                agent.writer.close()
+            if 'writer' in locals():
+                writer.close()
                 print("TensorBoard writer closed")
-                
+            
+            # Save training metrics
+            if 'training_metrics' in locals():
+                metrics_path = os.path.join('logs', f'training_metrics_{int(time.time())}.json')
+                with open(metrics_path, 'w') as f:
+                    json.dump(training_metrics, f)
+                print(f"Training metrics saved to {metrics_path}")
+            
         except Exception as e:
             print(f"Error during cleanup: {e}")
             traceback.print_exc()
-            
-        print("\nTraining completed")
+        
+        print("\nTraining session ended")
+
 
 if __name__ == "__main__":
     try:
