@@ -23,6 +23,7 @@ import traceback
 import casadi as ca
 import json
 from datetime import datetime
+from typing import List, Optional, Union,Dict
 
 def download_weights(url, save_path):
     """Download weights if they don't exist"""
@@ -213,11 +214,10 @@ class PPOMemory:
         self.log_probs.clear()
         self.masks.clear()
 
-import casadi as ca
-import numpy as np
+
 
 class MPCController:
-    def __init__(self, dt=0.1, N=20):
+    def __init__(self, dt=0.05, N=50):
         """Initialize MPC controller with prediction horizon N and timestep dt"""
         self.dt = dt
         self.N = N
@@ -235,7 +235,7 @@ class MPCController:
         self.n_equality_constraints = (self.N + 1) * self.n_states  # Dynamic constraints
         
         # MPC parameters for 4-dimensional state
-        self.Q = np.diag([1.0, 1.0, 0.5, 0.1])  # State weights (x, y, yaw, v)
+        self.Q = np.diag([1.0, 1.0, 1.0, 0.5])  # State weights (x, y, yaw, v)
         self.R = np.diag([0.1, 0.1])            # Control weights (steering, throttle)
         
         # Vehicle parameters
@@ -243,9 +243,9 @@ class MPCController:
         self.bounds = {
             'steer': [-1.0, 1.0],
             'throttle': [-1.0, 1.0],
-            'v_max': 20.0,  # Maximum velocity in m/s
-            'v_min': 5.0,   # Minimum velocity in m/s
-            'max_yaw_rate': 1.57  # Maximum yaw rate (rad/s)
+            'v_max': 10.0,  # Maximum velocity in m/s
+            'v_min': 0.0,   # Minimum velocity in m/s
+            'max_yaw_rate': 1.00 # Maximum yaw rate (rad/s)
         }
         
         # Safety parameters
@@ -457,6 +457,7 @@ class MPCController:
             print(f"Error in MPC solve: {e}")
             traceback.print_exc()
             return None
+        
 
 class PPOAgent:
     def __init__(self, state_dim, action_dim):
@@ -664,12 +665,12 @@ class CarEnv:
         self.MAX_MPC_FAILURES = 5
 
         self.reward_params = {
-            'collision_penalty': -100.0,
+            'collision_penalty': -50.0,
             'lane_deviation_weight': -0.1,
             'min_speed': 5.0,  # km/h
-            'target_speed': 20.0,  # km/h
+            'target_speed': 8.0,  # km/h
             'speed_weight': 0.1,
-            'stuck_penalty': -40.0,
+            'stuck_penalty': -10.0,
             'alive_bonus': 0.1,
             'distance_weight': 0.5
         }
@@ -713,23 +714,52 @@ class CarEnv:
             print(f"Error in should_use_mpc: {e}")
             return True  # Default to MPC on error
         
-    def get_reference_trajectory(self, current_state):
-        """Generate reference trajectory for MPC"""
+    def get_reference_trajectory(self,current_state):
         waypoints = []
-        location = self.vehicle.get_location()
-        waypoint = self.world.get_map().get_waypoint(location)
-        
+        waypoint = self.world.get_map().get_waypoint(self.vehicle.get_location())
+
         for i in range(self.mpc.N):
-            next_waypoint = waypoint.next(2.0)[0]  # 2.0m spacing
+            # Get next 4 waypoints at 1m intervals
+            next_waypoints = waypoint.next(1.0) 
+            if not next_waypoints:
+                break
+
+            waypoint = next_waypoints[0]
+
+            # Calculate curvature-based speed
+            road_curve = self.calculate_road_curvature(waypoint)
+            target_speed = max(2.0, 10.0 - 8.0*road_curve)  # Reduce speed in curves
+
             waypoints.append([
-                next_waypoint.transform.location.x,
-                next_waypoint.transform.location.y,
-                next_waypoint.transform.rotation.yaw * np.pi / 180.0,
-                10.0  # Target speed in km/h
+                waypoint.transform.location.x,
+                waypoint.transform.location.y,
+                waypoint.transform.rotation.yaw * np.pi / 180.0,
+                target_speed  # Adaptive speed
             ])
-            waypoint = next_waypoint
-            
+
         return np.array(waypoints)
+
+
+    def calculate_road_curvature(self, waypoint, lookahead=5):
+        """Estimate road curvature using multiple waypoints"""
+        points = []
+        current_wp = waypoint
+        for _ in range(lookahead):
+            next_wps = current_wp.next(2.0)
+            if not next_wps:
+                break
+            current_wp = next_wps[0]
+            points.append([current_wp.transform.location.x, 
+                          current_wp.transform.location.y])
+        
+        if len(points) < 3:
+            return 0.0
+        
+        # Fit circle to points and return curvature
+        x = np.array(points)[:,0]
+        y = np.array(points)[:,1]
+        curvature = np.polyfit(x, y, 2)[0]  # Quadratic fit
+        return abs(curvature)
 
     def _process_image(self, weak_self, image):
         self = weak_self()
@@ -1374,42 +1404,66 @@ class CarEnv:
             }
 
     def spawn_npcs(self):
-        """Spawn NPC vehicles near the training vehicle"""
+        """Spawn NPC vehicles near and in front of the training vehicle"""
         try:
-            number_of_vehicles = 10
-            spawn_radius = 50.0
+            number_of_vehicles = 5
+            spawn_radius = 40.0
+            # Define forward angle range (270° to 90° where 0° is forward)
+            min_angle = -90  # 270 degrees
+            max_angle = 90   # 90 degrees
 
             if self.vehicle is None:
                 print("Training vehicle not found! Cannot spawn NPCs.")
                 return
 
-            # Get training vehicle's location
+            # Get training vehicle's location and forward vector
             vehicle_location = self.vehicle.get_location()
+            vehicle_transform = self.vehicle.get_transform()
+            forward_vector = vehicle_transform.get_forward_vector()
 
             # Configure traffic manager
             traffic_manager = self.client.get_trafficmanager()
             traffic_manager.set_synchronous_mode(True)
-            traffic_manager.set_global_distance_to_leading_vehicle(1.5)
-            traffic_manager.global_percentage_speed_difference(-60.0)
+            traffic_manager.set_global_distance_to_leading_vehicle(1.0)
+            traffic_manager.global_percentage_speed_difference(-50.0)
 
             # Get all spawn points
             all_spawn_points = self.world.get_map().get_spawn_points()
 
-            # Filter spawn points to only include those within radius of training vehicle
+            # Filter spawn points to only include those within radius and in front of the vehicle
             nearby_spawn_points = []
             for spawn_point in all_spawn_points:
-                if spawn_point.location.distance(vehicle_location) <= spawn_radius:
-                    nearby_spawn_points.append(spawn_point)
+                # Calculate distance
+                distance = spawn_point.location.distance(vehicle_location)
+                if distance <= spawn_radius:
+                    # Calculate angle between forward vector and spawn point
+                    to_spawn_vector = carla.Vector3D(
+                        x=spawn_point.location.x - vehicle_location.x,
+                        y=spawn_point.location.y - vehicle_location.y,
+                        z=0
+                    )
+
+                    # Calculate angle in degrees
+                    angle = math.degrees(math.atan2(to_spawn_vector.y, to_spawn_vector.x) - 
+                                      math.atan2(forward_vector.y, forward_vector.x))
+                    # Normalize angle to [-180, 180]
+                    angle = (angle + 180) % 360 - 180
+
+                    # Check if spawn point is within the desired angle range
+                    if min_angle <= angle <= max_angle:
+                        nearby_spawn_points.append((spawn_point, distance))  # Store distance for sorting
+
+            # Sort spawn points by distance
+            nearby_spawn_points.sort(key=lambda x: x[1])  # Sort by distance
+            nearby_spawn_points = [sp[0] for sp in nearby_spawn_points]  # Extract just the spawn points
 
             if not nearby_spawn_points:
-                print(f"No spawn points found within {spawn_radius}m of training vehicle!")
-                # Fallback to closest spawn points if none found in radius
-                all_spawn_points.sort(key=lambda p: p.location.distance(vehicle_location))
-                nearby_spawn_points = all_spawn_points[:number_of_vehicles]
+                print(f"No suitable spawn points found in front of the training vehicle within {spawn_radius}m!")
+                return
 
-            print(f"Found {len(nearby_spawn_points)} potential spawn points near training vehicle")
+            print(f"Found {len(nearby_spawn_points)} potential spawn points in front of training vehicle")
 
-            # Spawn vehicles
+            # Rest of the spawning logic remains similar
             vehicle_bps = self.world.get_blueprint_library().filter('vehicle.*')
             vehicle_bps = [bp for bp in vehicle_bps if int(bp.get_attribute('number_of_wheels')) == 4]
 
@@ -1435,9 +1489,8 @@ class CarEnv:
 
                     try:
                         # Set more conservative speed for nearby vehicles
-                        traffic_manager.vehicle_percentage_speed_difference(vehicle, random.uniform(0, 10))
+                        traffic_manager.vehicle_percentage_speed_difference(vehicle, random.uniform(20, 50))
                         traffic_manager.distance_to_leading_vehicle(vehicle, random.uniform(0.5, 2.0))
-
 
                         spawned_count += 1
 
@@ -1445,10 +1498,9 @@ class CarEnv:
                         distance_to_ego = vehicle.get_location().distance(vehicle_location)
                         print(f"Spawned {vehicle.type_id} at {distance_to_ego:.1f}m from training vehicle")
 
-                        # Draw debug line to show spawn location
+                        # Draw debug visualization
                         debug = self.world.debug
                         if debug:
-                            # Draw a line from ego vehicle to spawned vehicle
                             debug.draw_line(
                                 vehicle_location,
                                 vehicle.get_location(),
@@ -1456,7 +1508,6 @@ class CarEnv:
                                 color=carla.Color(r=0, g=255, b=0),
                                 life_time=5.0
                             )
-                            # Draw point at spawn location
                             debug.draw_point(
                                 vehicle.get_location(),
                                 size=0.1,
@@ -1468,19 +1519,22 @@ class CarEnv:
                         print(f"Warning: Could not set some traffic manager parameters: {tm_error}")
                         continue
 
-            print(f"Successfully spawned {spawned_count} vehicles near training vehicle")
+            print(f"Successfully spawned {spawned_count} vehicles in front of training vehicle")
 
-            # Visualize spawn radius using points and lines
+            # Visualize spawn area (forward arc instead of full circle)
             try:
                 debug = self.world.debug
                 if debug:
-                    # Draw points around the radius (approximating a circle)
-                    num_points = 36  # Number of points to approximate circle
-                    for i in range(num_points):
-                        angle = (2 * math.pi * i) / num_points
+                    num_points = 18  # Number of points to approximate the arc
+                    for i in range(num_points + 1):
+                        angle_rad = math.radians(min_angle + (max_angle - min_angle) * i / num_points)
+                        # Rotate the point by vehicle's rotation
+                        vehicle_rotation = vehicle_transform.rotation.yaw
+                        total_angle = math.radians(vehicle_rotation) + angle_rad
+
                         point = carla.Location(
-                            x=vehicle_location.x + spawn_radius * math.cos(angle),
-                            y=vehicle_location.y + spawn_radius * math.sin(angle),
+                            x=vehicle_location.x + spawn_radius * math.cos(total_angle),
+                            y=vehicle_location.y + spawn_radius * math.sin(total_angle),
                             z=vehicle_location.z
                         )
                         debug.draw_point(
@@ -1489,11 +1543,12 @@ class CarEnv:
                             color=carla.Color(r=0, g=255, b=0),
                             life_time=5.0
                         )
-                        # Draw lines between points
                         if i > 0:
+                            prev_angle_rad = math.radians(min_angle + (max_angle - min_angle) * (i-1) / num_points)
+                            prev_total_angle = math.radians(vehicle_rotation) + prev_angle_rad
                             prev_point = carla.Location(
-                                x=vehicle_location.x + spawn_radius * math.cos((2 * math.pi * (i-1)) / num_points),
-                                y=vehicle_location.y + spawn_radius * math.sin((2 * math.pi * (i-1)) / num_points),
+                                x=vehicle_location.x + spawn_radius * math.cos(prev_total_angle),
+                                y=vehicle_location.y + spawn_radius * math.sin(prev_total_angle),
                                 z=vehicle_location.z
                             )
                             debug.draw_line(
