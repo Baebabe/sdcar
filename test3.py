@@ -245,11 +245,11 @@ class MPCController:
             'throttle': [-1.0, 1.0],
             'v_max': 10.0,  # Maximum velocity in m/s
             'v_min': 0.0,   # Minimum velocity in m/s
-            'max_yaw_rate': 1.00 # Maximum yaw rate (rad/s)
+            'max_yaw_rate': 1.25 # Maximum yaw rate (rad/s)
         }
         
         # Safety parameters
-        self.safety_distance = 3.0  # meters
+        self.safety_distance = 5.0  # meters
         self.object_weights = {
             'person': 5.0,      # Highest priority
             'vehicle': 4.0,
@@ -310,10 +310,10 @@ class MPCController:
                 # State error cost
                 ref_idx = self.n_states + k * self.n_states
                 state_error = X[:, k] - P[ref_idx:ref_idx + self.n_states]
-                obj = obj + ca.mtimes(state_error.T, ca.mtimes(self.Q, state_error))
+                obj += ca.mtimes(state_error.T, ca.mtimes(self.Q, state_error))
                 
                 # Control cost
-                obj = obj + ca.mtimes(U[:, k].T, ca.mtimes(self.R, U[:, k]))
+                obj += ca.mtimes(U[:, k].T, ca.mtimes(self.R, U[:, k]))
                 
                 # Next state based on vehicle dynamics
                 state_next = X[:, k] + self.dt * f(X[:, k], U[:, k])
@@ -390,7 +390,7 @@ class MPCController:
                 current_state,
                 reference_trajectory.reshape(-1)
             ]).astype(np.float64)
-            
+            self.adjust_for_turns(reference_trajectory)
             # Initialize bounds
             lbx = np.zeros(self.n_vars)
             ubx = np.zeros(self.n_vars)
@@ -457,7 +457,32 @@ class MPCController:
             print(f"Error in MPC solve: {e}")
             traceback.print_exc()
             return None
-        
+
+    def adjust_for_turns(self, reference_trajectory):
+        """Adjust target speed based on the curvature of the reference trajectory."""
+        # Calculate curvature and adjust speed
+        for i in range(len(reference_trajectory) - 1):
+            x1, y1, _, _ = reference_trajectory[i]
+            x2, y2, _, _ = reference_trajectory[i + 1]
+            curvature = np.arctan2(y2 - y1, x2 - x1)  # Simple curvature calculation
+            if abs(curvature) > 0.1:  # Threshold for sharp turns
+                # Reduce speed for sharp turns
+                reference_trajectory[i + 1][3] *= 0.5  # Reduce target speed by half
+
+    def solve_with_obstacle_avoidance(self, current_state, reference_trajectory, detected_objects):
+            """
+            Solve MPC optimization problem with obstacle avoidance.
+            """
+            # Check for obstacles in the same lane
+            for obj in detected_objects:
+                if obj['depth'] < self.safety_distance:  # If an object is too close
+                    # Apply braking logic
+                    throttle = -1.0  # Full brake
+                    return np.array([0.0, throttle])  # No steering, just brake
+    
+            # Proceed with normal solving
+            return self.solve(current_state, reference_trajectory, detected_objects)
+
 
 class PPOAgent:
     def __init__(self, state_dim, action_dim):
@@ -1262,7 +1287,7 @@ class CarEnv:
                 reference_trajectory = self.get_reference_trajectory(state)
 
                 # Get MPC control action
-                mpc_action = self.mpc.solve(
+                mpc_action = self.mpc.solve_with_obstacle_avoidance(
                     state, 
                     reference_trajectory,
                     detected_objects
@@ -1425,7 +1450,7 @@ class CarEnv:
             traffic_manager = self.client.get_trafficmanager()
             traffic_manager.set_synchronous_mode(True)
             traffic_manager.set_global_distance_to_leading_vehicle(1.0)
-            traffic_manager.global_percentage_speed_difference(-50.0)
+            traffic_manager.global_percentage_speed_difference(50.0)
 
             # Get all spawn points
             all_spawn_points = self.world.get_map().get_spawn_points()
@@ -1490,7 +1515,7 @@ class CarEnv:
                     try:
                         # Set more conservative speed for nearby vehicles
                         traffic_manager.vehicle_percentage_speed_difference(vehicle, random.uniform(20, 50))
-                        traffic_manager.distance_to_leading_vehicle(vehicle, random.uniform(0.5, 2.0))
+                        traffic_manager.distance_to_leading_vehicle(vehicle, random.uniform(0.5, 1.0))
 
                         spawned_count += 1
 
