@@ -24,6 +24,7 @@ import casadi as ca
 import json
 from datetime import datetime
 from typing import List, Optional, Union,Dict
+import heapq
 
 def download_weights(url, save_path):
     """Download weights if they don't exist"""
@@ -242,8 +243,8 @@ class MPCController:
         self.L = 2.9  # Wheelbase
         self.bounds = {
             'steer': [-1.0, 1.0],
-            'throttle': [-1.0, 1.0],
-            'v_max': 10.0,  # Maximum velocity in m/s
+            'throttle': [0.0, 1.0],
+            'v_max': 20.0,  # Maximum velocity in m/s
             'v_min': 0.0,   # Minimum velocity in m/s
             'max_yaw_rate': 1.00 # Maximum yaw rate (rad/s)
         }
@@ -290,7 +291,7 @@ class MPCController:
                 v * ca.cos(yaw),
                 v * ca.sin(yaw),
                 v * ca.tan(steer) / self.L,
-                2.5 * throttle - 0.1 * v
+                5 * throttle - 0.2* v
             )
             
             # Create the integration function
@@ -310,10 +311,10 @@ class MPCController:
                 # State error cost
                 ref_idx = self.n_states + k * self.n_states
                 state_error = X[:, k] - P[ref_idx:ref_idx + self.n_states]
-                obj = obj + ca.mtimes(state_error.T, ca.mtimes(self.Q, state_error))
+                obj += ca.mtimes(state_error.T, ca.mtimes(self.Q, state_error))
                 
                 # Control cost
-                obj = obj + ca.mtimes(U[:, k].T, ca.mtimes(self.R, U[:, k]))
+                obj += ca.mtimes(U[:, k].T, ca.mtimes(self.R, U[:, k]))
                 
                 # Next state based on vehicle dynamics
                 state_next = X[:, k] + self.dt * f(X[:, k], U[:, k])
@@ -371,57 +372,82 @@ class MPCController:
             return False
 
     def solve(self, current_state, reference_trajectory, detected_objects):
-        """
-        Solve MPC optimization problem
-        """
+        """ Solve MPC optimization problem """
         try:
             # Convert current state to numpy array
-            current_state = np.array(current_state[:4], dtype=np.float64)
-            
+            current_state = np.array(current_state[:4], dtype=np.float64).reshape(-1)
+
             # Ensure reference trajectory has correct dimensions
             if not isinstance(reference_trajectory, np.ndarray):
                 reference_trajectory = np.array(reference_trajectory, dtype=np.float64)
-            
-            if reference_trajectory.shape[1] > 4:
+
+            # If reference trajectory is a single point, extend it to N+1 points
+            if reference_trajectory.shape[0] == 1:
+                reference_trajectory = np.tile(reference_trajectory, (self.N + 1, 1))
+            elif reference_trajectory.shape[1] > 4:
                 reference_trajectory = reference_trajectory[:, :4]
-            
-            # Create parameter vector
+
+            # Ensure we have exactly N+1 timesteps
+            if reference_trajectory.shape[0] < self.N + 1:
+                last_point = reference_trajectory[-1:]
+                points_needed = self.N + 1 - reference_trajectory.shape[0]
+                extension = np.tile(last_point, (points_needed, 1))
+                reference_trajectory = np.vstack([reference_trajectory, extension])
+            elif reference_trajectory.shape[0] > self.N + 1:
+                reference_trajectory = reference_trajectory[:(self.N + 1), :]
+
+            # Calculate expected parameter vector size
+            expected_param_size = 4 + (self.N * 4)  # current_state (4) + N reference points (4 each)
+
+            # Create parameter vector with only N reference points (excluding the last one)
             param_vector = np.concatenate([
                 current_state,
-                reference_trajectory.reshape(-1)
+                reference_trajectory[:-1].reshape(-1)  # Use only N points, not N+1
             ]).astype(np.float64)
-            
+
+            # Verify parameter vector size
+            if param_vector.size != expected_param_size:
+                print(f"Warning: Parameter vector size mismatch. Expected {expected_param_size}, got {param_vector.size}")
+                # Adjust if necessary
+                param_vector = param_vector[:expected_param_size]
+
+            # Debug print
+            print(f"Current state shape: {current_state.shape}")
+            print(f"Reference trajectory shape: {reference_trajectory.shape}")
+            print(f"Parameter vector shape: {param_vector.shape}")
+            print(f"Expected parameter size: {expected_param_size}")
+
             # Initialize bounds
             lbx = np.zeros(self.n_vars)
             ubx = np.zeros(self.n_vars)
-            
+
             # State bounds
             for i in range(self.N + 1):
                 lbx[i * self.n_states:(i + 1) * self.n_states] = [-np.inf, -np.inf, -2*np.pi, self.bounds['v_min']]
                 ubx[i * self.n_states:(i + 1) * self.n_states] = [np.inf, np.inf, 2*np.pi, self.bounds['v_max']]
-            
+
             # Control bounds
             control_start = (self.N + 1) * self.n_states
             for i in range(self.N):
                 idx = control_start + i * self.n_controls
                 lbx[idx:idx + self.n_controls] = [self.bounds['steer'][0], self.bounds['throttle'][0]]
                 ubx[idx:idx + self.n_controls] = [self.bounds['steer'][1], self.bounds['throttle'][1]]
-            
+
             # Constraint bounds
             lbg = np.zeros(self.n_constraints)
             ubg = np.zeros(self.n_constraints)
-            
+
             # Dynamic constraints (equality)
             lbg[:self.n_equality_constraints] = 0
             ubg[:self.n_equality_constraints] = 0
-            
+
             # Yaw rate constraints
             if self.N > 1:
                 yaw_rate_start = self.n_equality_constraints
                 for i in range(self.N - 1):
                     lbg[yaw_rate_start + i] = -self.bounds['max_yaw_rate']
                     ubg[yaw_rate_start + i] = self.bounds['max_yaw_rate']
-            
+
             try:
                 # Solve the optimization problem
                 sol = self.solver(
@@ -432,32 +458,52 @@ class MPCController:
                     ubg=ubg,
                     p=param_vector
                 )
-                
+
                 # Check if solution was found
                 if self.solver.stats()['success']:
-                    # Get solution
                     opt_vars = sol['x'].full().flatten()
-                    # Extract first control action
                     control_start = (self.N + 1) * self.n_states
                     optimal_control = opt_vars[control_start:control_start + self.n_controls]
-                    
-                    # Update initial guess for warm start
                     self.x0 = opt_vars
-                    
                     return optimal_control
                 else:
                     print("MPC solver failed to find a solution")
                     return None
-                
+
             except Exception as e:
                 print(f"MPC solver error: {e}")
                 return None
-                
+
         except Exception as e:
             print(f"Error in MPC solve: {e}")
             traceback.print_exc()
             return None
-        
+
+    def adjust_for_turns(self, reference_trajectory):
+        """Adjust target speed based on the curvature of the reference trajectory."""
+        # Calculate curvature and adjust speed
+        for i in range(len(reference_trajectory) - 1):
+            x1, y1, _, _ = reference_trajectory[i]
+            x2, y2, _, _ = reference_trajectory[i + 1]
+            curvature = np.arctan2(y2 - y1, x2 - x1)  # Simple curvature calculation
+            if abs(curvature) > 0.1:  # Threshold for sharp turns
+                # Reduce speed for sharp turns
+                reference_trajectory[i + 1][3] *= 0.5  # Reduce target speed by half
+
+    def solve_with_obstacle_avoidance(self, current_state, reference_trajectory, detected_objects):
+            """
+            Solve MPC optimization problem with obstacle avoidance.
+            """
+            # Check for obstacles in the same lane
+            for obj in detected_objects:
+                if obj['depth'] < self.safety_distance:  # If an object is too close
+                    # Apply braking logic
+                    throttle = -0.8  # Full brake
+                    return np.array([0.0, throttle])  # No steering, just brake
+
+            # Proceed with normal solving
+            return self.solve(current_state, reference_trajectory, detected_objects)
+
 
 class PPOAgent:
     def __init__(self, state_dim, action_dim):
@@ -611,6 +657,81 @@ class PPOAgent:
             print(f"Error loading checkpoint: {e}")
             return False
 
+class GlobalPathPlanner:
+    def __init__(self, world, sampling_resolution=2.0):
+        self.world = world
+        self.sampling_resolution = sampling_resolution
+        self.topology = self._get_topology()
+        
+    def _get_topology(self):
+        topology = []
+        # Generate waypoints for the entire map
+        waypoints = self.world.get_map().generate_waypoints(self.sampling_resolution)
+        
+        # Create a graph of waypoints
+        for waypoint in waypoints:
+            connections = []
+            # Get next waypoints in all directions
+            next_waypoints = waypoint.next(self.sampling_resolution)
+            if next_waypoints:
+                connections.append(next_waypoints[0])  # Take first option
+            
+            # Get previous waypoints
+            prev_waypoints = waypoint.previous(self.sampling_resolution)
+            if prev_waypoints:
+                connections.append(prev_waypoints[0])
+            
+            topology.append({
+                'waypoint': waypoint,
+                'connections': connections
+            })
+        return topology
+
+    def heuristic(self, a, b):
+        return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2)
+
+    def a_star_search(self, start, goal):
+        frontier = []
+        heapq.heappush(frontier, (0, start))
+        came_from = {}
+        cost_so_far = {}
+        came_from[start] = None
+        cost_so_far[start] = 0
+
+        while frontier:
+            current = heapq.heappop(frontier)[1]
+
+            if self.heuristic(current.transform.location, goal.transform.location) < 5.0:
+                break
+
+            for node in self.topology:
+                if node['waypoint'] == current:
+                    for next_wp in node['connections']:
+                        new_cost = cost_so_far[current] + self.heuristic(
+                            current.transform.location,
+                            next_wp.transform.location
+                        )
+                        if next_wp not in cost_so_far or new_cost < cost_so_far[next_wp]:
+                            cost_so_far[next_wp] = new_cost
+                            priority = new_cost + self.heuristic(
+                                next_wp.transform.location,
+                                goal.transform.location
+                            )
+                            heapq.heappush(frontier, (priority, next_wp))
+                            came_from[next_wp] = current
+
+        # Reconstruct path
+        path = []
+        current_wp = current
+        while current_wp != start:
+            path.append(current_wp)
+            current_wp = came_from[current_wp]
+        path.append(start)
+        path.reverse()
+        
+        return path
+
+
 class CarEnv:
     def __init__(self):
         # Existing attributes
@@ -637,6 +758,11 @@ class CarEnv:
         self.display = None
         self.clock = None
         self.init_pygame_display()
+
+        self.global_path = []
+        self.current_path_index = 0
+        self.target_destination = None
+        self.path_planner = None
 
         # Camera settings
         self.camera_transform = carla.Transform(
@@ -668,7 +794,7 @@ class CarEnv:
             'collision_penalty': -50.0,
             'lane_deviation_weight': -0.1,
             'min_speed': 5.0,  # km/h
-            'target_speed': 8.0,  # km/h
+            'target_speed': 15.0,  # km/h
             'speed_weight': 0.1,
             'stuck_penalty': -10.0,
             'alive_bonus': 0.1,
@@ -713,7 +839,62 @@ class CarEnv:
         except Exception as e:
             print(f"Error in should_use_mpc: {e}")
             return True  # Default to MPC on error
+    
+    
+    def select_distant_points(self, min_distance=200.0):
+        """Select two points at least min_distance apart"""
+        spawn_points = self.world.get_map().get_spawn_points()
+
+        # Use the episode's spawn point if it exists, otherwise create one for this episode
+        if not hasattr(self, '_episode_spawn_point'):
+            self._episode_spawn_point = random.choice(spawn_points)
+        start_point = self._episode_spawn_point
+
+        # Find distant point
+        max_attempts = 20
+        for _ in range(max_attempts):
+            end_point = random.choice(spawn_points)
+            distance = start_point.location.distance(end_point.location)
+            if distance >= min_distance:
+                return start_point, end_point
+        return start_point, end_point
+
+    def generate_global_path(self):
+        """Generate a new global path using A*"""
+        start_wp, end_wp = self.select_distant_points()
+    
+        # Draw start (green) and end (red) markers
+        self.world.debug.draw_string(
+            start_wp.location + carla.Location(z=2.0),
+            'START',
+            color=carla.Color(r=0, g=255, b=0),
+            life_time=60.0
+        )
+        self.world.debug.draw_string(
+            end_wp.location + carla.Location(z=2.0),
+            'END',
+            color=carla.Color(r=255, g=0, b=0),
+            life_time=60.0
+        )
+        start_waypoint = self.world.get_map().get_waypoint(start_wp.location)
+        end_waypoint = self.world.get_map().get_waypoint(end_wp.location)
         
+        self.global_path = self.path_planner.a_star_search(start_waypoint, end_waypoint)
+        self.current_path_index = 0
+        
+        # Draw debug path
+        if self.global_path:
+            for i in range(len(self.global_path)-1):
+                self.world.debug.draw_line(
+                    self.global_path[i].transform.location + carla.Location(z=0.5),
+                    self.global_path[i+1].transform.location + carla.Location(z=0.5),
+                    thickness=0.1,
+                    color=carla.Color(r=255, g=0, b=0),
+                    life_time=60.0
+                )
+
+
+
     def get_reference_trajectory(self,current_state):
         waypoints = []
         waypoint = self.world.get_map().get_waypoint(self.vehicle.get_location())
@@ -728,7 +909,7 @@ class CarEnv:
 
             # Calculate curvature-based speed
             road_curve = self.calculate_road_curvature(waypoint)
-            target_speed = max(2.0, 10.0 - 8.0*road_curve)  # Reduce speed in curves
+            target_speed = max(5.0, 20.0 - 15.0*road_curve)  # Reduce speed in curves
 
             waypoints.append([
                 waypoint.transform.location.x,
@@ -738,7 +919,6 @@ class CarEnv:
             ])
 
         return np.array(waypoints)
-
 
     def calculate_road_curvature(self, waypoint, lookahead=5):
         """Estimate road curvature using multiple waypoints"""
@@ -812,16 +992,24 @@ class CarEnv:
     def reset(self):
         """Reset environment with improved movement verification"""
         print("Starting environment reset...")
-        self.cleanup_actors()
-        self.cleanup_npcs()
+        self.cleanup_actors()  # Clean up previous actors
+        self.cleanup_npcs()    # Clean up NPCs  
+
+
+        if hasattr(self, '_episode_spawn_point'):
+            delattr(self, '_episode_spawn_point')
+
+        # Generate new global path
+        self.generate_global_path() 
+
+        # Setup new episode
+        if not self.setup_vehicle():  # This will handle vehicle spawning
+            raise Exception("Failed to setup vehicle")  
+
         self.collision_hist = []  # Clear collision history
         self.stuck_time = 0
         self.episode_start = datetime.now()  # Set as datetime object
-        self.last_location = None
-
-        # Setup new episode
-        if not self.setup_vehicle():
-            raise Exception("Failed to setup vehicle")
+        self.last_location = None   
 
         # Wait for initial camera frame
         print("Waiting for camera initialization...")
@@ -830,53 +1018,79 @@ class CarEnv:
             self.world.tick()
             if time.time() > timeout:
                 raise Exception("Camera initialization timeout")
-            time.sleep(0.1)
+            time.sleep(0.1) 
 
         # Spawn NPCs after camera is ready
-        self.spawn_npcs()
+        self.spawn_npcs()   
 
         # Let the physics settle and NPCs initialize
         for _ in range(20):
             self.world.tick()
-            time.sleep(0.05)
+            time.sleep(0.05)    
 
         # Get initial state after everything is set up
         state = self.get_state()
         if state is None:
-            raise Exception("Failed to get initial state")
+            raise Exception("Failed to get initial state")  
 
         return state
 
     def setup_vehicle(self):
         """Spawn and setup the ego vehicle"""
         try:
-            print("Starting vehicle setup...")
+            print("Starting vehicle setup...")  
 
             # Get the blueprint library
             blueprint_library = self.world.get_blueprint_library()
-            print("Got blueprint library")
+            print("Got blueprint library")  
 
             # Get the vehicle blueprint
             vehicle_bp = blueprint_library.filter('model3')[0]
-            print("Got vehicle blueprint")
+            print("Got vehicle blueprint")  
 
             # Get random spawn point
             spawn_points = self.world.get_map().get_spawn_points()
             if not spawn_points:
-                raise Exception("No spawn points found")
-            spawn_point = random.choice(spawn_points)
-            print(f"Selected spawn point: {spawn_point}")
+                raise Exception("No spawn points found")    
 
-            # Spawn the vehicle
-            self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
-            print("Vehicle spawned successfully")
+            # Use the episode's spawn point if it exists
+            if hasattr(self, '_episode_spawn_point'):
+                spawn_point = self._episode_spawn_point
+                vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
+                if vehicle is not None:
+                    self.vehicle = vehicle
+                    print("Vehicle spawned successfully at episode spawn point")
+                else:
+                    # If episode spawn point fails, try random points
+                    for _ in range(10):
+                        spawn_point = random.choice(spawn_points)
+                        vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
+                        if vehicle is not None:
+                            self.vehicle = vehicle
+                            self._episode_spawn_point = spawn_point  # Update episode spawn point
+                            print("Vehicle spawned successfully at new spawn point")
+                            break
+                    else:
+                        raise Exception("No valid spawn points found after 10 attempts")
+            else:
+                # If no episode spawn point exists, try random points
+                for _ in range(10):
+                    spawn_point = random.choice(spawn_points)
+                    vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
+                    if vehicle is not None:
+                        self.vehicle = vehicle
+                        self._episode_spawn_point = spawn_point  # Store the successful spawn point
+                        print("Vehicle spawned successfully")
+                        break
+                else:
+                    raise Exception("No valid spawn points found after 10 attempts")
 
-            # Set up the camera
+            # Rest of the setup code remains the same...
             camera_bp = blueprint_library.find('sensor.camera.rgb')
             camera_bp.set_attribute('image_size_x', str(IM_WIDTH))
             camera_bp.set_attribute('image_size_y', str(IM_HEIGHT))
             camera_bp.set_attribute('fov', '90')
-            print("Camera blueprint configured")
+            print("Camera blueprint configured")    
 
             # Spawn and set up camera
             self.camera = self.world.spawn_actor(
@@ -884,12 +1098,12 @@ class CarEnv:
                 self.camera_transform,
                 attach_to=self.vehicle
             )
-            print("Camera spawned successfully")
+            print("Camera spawned successfully")    
 
             # Set up camera callback
             weak_self = weakref.ref(self)
             self.camera.listen(lambda image: self._process_image(weak_self, image))
-            print("Camera callback set up")
+            print("Camera callback set up") 
 
             # Set up collision sensor
             collision_bp = blueprint_library.find('sensor.other.collision')
@@ -898,11 +1112,11 @@ class CarEnv:
                 carla.Transform(),
                 attach_to=self.vehicle
             )
-            print("Collision sensor spawned")
+            print("Collision sensor spawned")   
 
             # Set up collision callback
             self.collision_sensor.listen(lambda event: self.collision_hist.append(event))
-            print("Collision callback set up")
+            print("Collision callback set up")  
 
             # Wait for sensors to initialize
             for _ in range(10):  # Wait up to 10 ticks
@@ -910,12 +1124,12 @@ class CarEnv:
                 if self.front_camera is not None:
                     print("Sensors initialized successfully")
                     return True
-                time.sleep(0.1)
+                time.sleep(0.1) 
 
             if self.front_camera is None:
-                raise Exception("Camera failed to initialize")
+                raise Exception("Camera failed to initialize")  
 
-            return True
+            return True 
 
         except Exception as e:
             print(f"Error setting up vehicle: {e}")
@@ -923,6 +1137,7 @@ class CarEnv:
             traceback.print_exc()
             self.cleanup_actors()
             return False
+
 
     def cleanup_actors(self):
         """Clean up all spawned actors"""
@@ -963,6 +1178,7 @@ class CarEnv:
             
             print("Getting world...")
             self.world = self.client.get_world()
+            self.path_planner = GlobalPathPlanner(self.world)
             
             # Set up traffic manager
             self.traffic_manager = self.client.get_trafficmanager(8000)
@@ -1176,7 +1392,7 @@ class CarEnv:
             # Check if vehicle is stuck
             if current_speed < self.reward_params['min_speed']:
                 self.stuck_time += 0.1
-                if self.stuck_time > 3.0:
+                if self.stuck_time > 20.0:
                     done = True
                     reward += self.reward_params['stuck_penalty']
                     info['termination_reason'] = 'stuck'
@@ -1193,6 +1409,11 @@ class CarEnv:
                 reward += self.reward_params['collision_penalty']
                 done = True
                 info['termination_reason'] = 'collision'
+
+            if self.global_path:
+                target_wp = self.global_path[self.current_path_index]
+                distance_to_path = target_wp.transform.location.distance(self.vehicle.get_location())
+                reward -= distance_to_path * 0.1 
 
             # Lane keeping reward
             waypoint = self.world.get_map().get_waypoint(location)
@@ -1262,7 +1483,7 @@ class CarEnv:
                 reference_trajectory = self.get_reference_trajectory(state)
 
                 # Get MPC control action
-                mpc_action = self.mpc.solve(
+                mpc_action = self.mpc.solve_with_obstacle_avoidance(
                     state, 
                     reference_trajectory,
                     detected_objects
@@ -1342,6 +1563,21 @@ class CarEnv:
             except Exception as tick_error:
                 print(f"Simulation tick error: {tick_error}")
                 return None, 0, True, info
+            
+            # Draw current target waypoint
+            if self.global_path and self.current_path_index < len(self.global_path):
+                target_wp = self.global_path[self.current_path_index]
+                if self.global_path:
+                    path_length = len(self.global_path)
+                    for i in range(path_length - 1):
+                        # Draw line segments
+                        self.world.debug.draw_line(
+                            self.global_path[i].transform.location + carla.Location(z=0.5),
+                            self.global_path[i + 1].transform.location + carla.Location(z=0.5),
+                            thickness=20.0,
+                            color=carla.Color(r=0, g=255, b=0),
+                            life_time=0.5  # Slightly longer than the step time
+                        )
 
             # Get new state
             new_state = self.get_state()
@@ -1425,7 +1661,7 @@ class CarEnv:
             traffic_manager = self.client.get_trafficmanager()
             traffic_manager.set_synchronous_mode(True)
             traffic_manager.set_global_distance_to_leading_vehicle(1.0)
-            traffic_manager.global_percentage_speed_difference(-50.0)
+            traffic_manager.global_percentage_speed_difference(50.0)
 
             # Get all spawn points
             all_spawn_points = self.world.get_map().get_spawn_points()
@@ -1490,7 +1726,7 @@ class CarEnv:
                     try:
                         # Set more conservative speed for nearby vehicles
                         traffic_manager.vehicle_percentage_speed_difference(vehicle, random.uniform(20, 50))
-                        traffic_manager.distance_to_leading_vehicle(vehicle, random.uniform(0.5, 2.0))
+                        traffic_manager.distance_to_leading_vehicle(vehicle, random.uniform(0.5, 1.0))
 
                         spawned_count += 1
 
@@ -1607,6 +1843,7 @@ class CarEnv:
         except Exception as e:
             print(f"Error closing environment: {e}")
             traceback.print_exc()
+
     
 
 
