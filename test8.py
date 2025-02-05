@@ -1841,7 +1841,7 @@ class CarEnv:
 
                 # Get MPC control action
                 mpc_action = self.mpc.solve_with_obstacle_avoidance(
-                    self.state, 
+                    current_state, 
                     reference_trajectory,
                     self.detected_objects
                 )
