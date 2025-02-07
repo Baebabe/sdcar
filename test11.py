@@ -25,6 +25,7 @@ import json
 from datetime import datetime
 from typing import List, Optional, Union,Dict
 import heapq
+from scipy.interpolate import CubicSpline
 
 def download_weights(url, save_path):
     """Download weights if they don't exist"""
@@ -236,8 +237,8 @@ class MPCController:
         self.n_equality_constraints = (self.N + 1) * self.n_states  # Dynamic constraints
         
         # MPC parameters for 4-dimensional state
-        self.Q = np.diag([10.0, 10.0, 1.0, 2.0])  # x, y, yaw, velocity
-        self.R = np.diag([0.1, 0.1])  # steering, throttle
+        self.Q = np.diag([30.0, 30.0, 10.0, 5.0])  # Higher weights on position/yaw
+        self.R = np.diag([0.05, 0.05])  # Lower control penalty
 
         
         # Vehicle parameters
@@ -247,7 +248,7 @@ class MPCController:
             'throttle': [0, 1.0],
             'v_max': 15.0,  # Maximum velocity in m/s
             'v_min': 0.0,   # Minimum velocity in m/s
-            'max_yaw_rate': 1.57 # Maximum yaw rate (rad/s)
+            'max_yaw_rate': 3.14 # Maximum yaw rate (rad/s)
         }
         
         # Safety parameters
@@ -266,7 +267,7 @@ class MPCController:
         self._setup_optimization()
 
     def _setup_optimization(self):
-        """Setup MPC optimization problem using CasADi"""
+        """Setup MPC optimization problem using CasADi with terminal cost"""
         try:
             # State variables
             x = ca.SX.sym('x')
@@ -274,19 +275,19 @@ class MPCController:
             yaw = ca.SX.sym('yaw')
             v = ca.SX.sym('v')
             state = ca.vertcat(x, y, yaw, v)
-            
+
             # Control variables
             steer = ca.SX.sym('steer')
             throttle = ca.SX.sym('throttle')
             controls = ca.vertcat(steer, throttle)
-            
+
             # Decision variables
             X = ca.SX.sym('X', self.n_states, self.N + 1)
             U = ca.SX.sym('U', self.n_controls, self.N)
-            
+
             # Parameters (current state and reference trajectory)
             P = ca.SX.sym('P', self.n_states + self.n_states * self.N)
-            
+
             # Vehicle model (kinematic bicycle model)
             rhs = ca.vertcat(
                 v * ca.cos(yaw),
@@ -294,47 +295,51 @@ class MPCController:
                 v * ca.tan(ca.fmin(ca.fmax(steer, -1.0), 1.0)) / self.L,  # Clipped steering
                 5*throttle - 0.2*v*v # Quadratic air resistance
             )
-            
+
             # Create the integration function
             f = ca.Function('f', [state, controls], [rhs])
-            
+
             # Initialize constraint vectors
             g = []
-            
+
             # Objective function
             obj = 0
-            
+
             # Initial state constraint
             g.append(X[:, 0] - P[0:self.n_states])
-            
+
             # Dynamic constraints and cost for each step
             for k in range(self.N):
                 # State error cost
                 ref_idx = self.n_states + k * self.n_states
                 state_error = X[:, k] - P[ref_idx:ref_idx + self.n_states]
                 obj += ca.mtimes(state_error.T, ca.mtimes(self.Q, state_error))
-                
+
                 # Control cost
                 obj += ca.mtimes(U[:, k].T, ca.mtimes(self.R, U[:, k]))
-                
+
                 # Next state based on vehicle dynamics
                 state_next = X[:, k] + self.dt * f(X[:, k], U[:, k])
                 g.append(X[:, k + 1] - state_next)
-                
+
                 # Yaw rate constraint if k > 0
                 if k > 0:
                     yaw_rate = (X[2, k] - X[2, k-1]) / self.dt
                     g.append(yaw_rate)
-            
+
+            # Add terminal cost
+            terminal_error = X[:, -1] - P[-self.n_states:]
+            obj += 10 * ca.mtimes(terminal_error.T, ca.mtimes(self.Q, terminal_error))
+
             # Create optimization variables
             opt_vars = ca.vertcat(
                 ca.reshape(X, -1, 1),
                 ca.reshape(U, -1, 1)
             )
-            
+
             # Concatenate constraints
             g = ca.vertcat(*g)
-            
+
             # Create the NLP
             nlp = {
                 'x': opt_vars,
@@ -342,31 +347,31 @@ class MPCController:
                 'g': g,
                 'p': P
             }
-            
+
             # Solver options
             opts = {
-                'ipopt.print_level': 0,
-                'ipopt.max_iter': 100,
-                'ipopt.tol': 1e-4,
-                'ipopt.acceptable_tol': 1e-4,
-                'print_time': 0,
-                'ipopt.warm_start_init_point': 'yes',
-                'ipopt.mu_strategy': 'adaptive'
+            'ipopt.print_level': 0,
+            'ipopt.max_iter': 200,
+            'ipopt.tol': 1e-3,  # Relaxed tolerance
+            'ipopt.acceptable_tol': 1e-2,
+            'print_time': 0,
+            'ipopt.warm_start_init_point': 'yes',
+            'ipopt.mu_strategy': 'adaptive'
             }
-            
+
             # Create solver
             self.solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
-            
+
             # Store variables for later use
             self.X = X
             self.U = U
             self.f = f
             self.opt_vars = opt_vars
             self.n_constraints = g.size1()
-            
+
             print("MPC optimization problem setup completed successfully")
             return True
-            
+
         except Exception as e:
             print(f"Error in MPC setup_optimization: {e}")
             traceback.print_exc()
@@ -397,6 +402,22 @@ class MPCController:
             elif reference_trajectory.shape[0] > self.N + 1:
                 reference_trajectory = reference_trajectory[:(self.N + 1), :]
 
+            # Warm start initialization
+            if self.x0 is not None:
+                # Shift previous solution
+                prev_states = self.x0[: (self.N+1)*self.n_states].reshape(self.N+1, self.n_states)
+                prev_controls = self.x0[(self.N+1)*self.n_states:].reshape(self.N, self.n_controls)
+
+                # Shift states forward
+                prev_states[:-1] = prev_states[1:]
+                prev_states[-1] = prev_states[-2]  # Repeat last state
+
+                # Shift controls forward
+                prev_controls[:-1] = prev_controls[1:]
+                prev_controls[-1] = prev_controls[-2]  # Repeat last control
+
+                self.x0 = np.concatenate([prev_states.flatten(), prev_controls.flatten()])
+
             # Calculate expected parameter vector size
             expected_param_size = self.n_states + self.N * self.n_states  # current_state (4) + N reference points (4 each)
 
@@ -411,12 +432,6 @@ class MPCController:
                 print(f"Warning: Parameter vector size mismatch. Expected {expected_param_size}, got {param_vector.size}")
                 # Adjust if necessary
                 param_vector = param_vector[:expected_param_size]
-
-            # Debug print
-            print(f"Current state shape: {current_state.shape}")
-            print(f"Reference trajectory shape: {reference_trajectory.shape}")
-            print(f"Parameter vector shape: {param_vector.shape}")
-            print(f"Expected parameter size: {expected_param_size}")
 
             # Initialize bounds
             lbx = np.zeros(self.n_vars)
@@ -466,30 +481,38 @@ class MPCController:
                     control_start = (self.N + 1) * self.n_states
                     optimal_control = opt_vars[control_start:control_start + self.n_controls]
                     self.x0 = opt_vars
+
+                    # Store the last successful control
+                    self.last_control = optimal_control
                     return optimal_control
                 else:
-                    print("MPC solver failed to find a solution")
-                    return None
+                    print("MPC failed, using previous control")
+                    # Fallback to last control or a safe default
+                    return self.last_control if hasattr(self, 'last_control') else np.array([0.0, -0.5])
 
             except Exception as e:
                 print(f"MPC solver error: {e}")
-                return None
+                # Fallback to gentle braking
+                return np.array([0.0, -0.5])
 
         except Exception as e:
             print(f"Error in MPC solve: {e}")
             traceback.print_exc()
-            return None
+            # Fallback to gentle braking in case of any unexpected errors
+            return np.array([0.0, -0.5])
 
     def adjust_for_turns(self, reference_trajectory):
-        """Adjust target speed based on the curvature of the reference trajectory."""
-        # Calculate curvature and adjust speed
-        for i in range(len(reference_trajectory) - 1):
-            x1, y1, _, _ = reference_trajectory[i]
-            x2, y2, _, _ = reference_trajectory[i + 1]
-            curvature = np.arctan2(y2 - y1, x2 - x1)  # Simple curvature calculation
-            if abs(curvature) > 0.1:  # Threshold for sharp turns
-                # Reduce speed for sharp turns
-                reference_trajectory[i + 1][3] *= 0.5  # Reduce target speed by half
+        max_lat_accel = 2.5  # m/s²
+        for i in range(1, len(reference_trajectory)):
+            dx = reference_trajectory[i][0] - reference_trajectory[i-1][0]
+            dy = reference_trajectory[i][1] - reference_trajectory[i-1][1]
+            dist = np.hypot(dx, dy)
+            if dist < 0.1:
+                continue
+                
+            curvature = abs(reference_trajectory[i][2] - reference_trajectory[i-1][2]) / dist
+            max_speed = np.sqrt(max_lat_accel / (curvature + 1e-3))  # Avoid division by zero
+            reference_trajectory[i][3] = min(reference_trajectory[i][3], max_speed)
 
     def solve_with_obstacle_avoidance(self, current_state, reference_trajectory, detected_objects):
             """
@@ -688,130 +711,10 @@ class GlobalPathPlanner:
             })
         return topology
 
-    # def a_star_search(self, start, goal):
-    #     """A* search algorithm to find shortest path"""
-    #     print("Starting A* search...")
-
-    #     class ComparableWaypoint:
-    #         def __init__(self, waypoint, priority):
-    #             self.waypoint = waypoint
-    #             self.priority = priority
-
-    #         def __lt__(self, other):
-    #             return self.priority < other.priority
-
-    #     frontier = []
-    #     heapq.heappush(frontier, ComparableWaypoint(start, 0))
-    #     came_from = {}
-    #     cost_so_far = {}
-    #     came_from[start] = None
-    #     cost_so_far[start] = 0
-
-    #     while frontier:
-    #         current = heapq.heappop(frontier).waypoint
-
-    #         # Check if we're close enough to goal
-    #         if self.heuristic(current.transform.location, goal.transform.location) < 2.0:
-    #             print("Goal found!")
-    #             break
-
-    #         # Get next possible waypoints using Carla's built-in next waypoint
-    #         next_waypoints = current.next(2.0)  # Get waypoints 2 meters ahead
-
-    #         for next_wp in next_waypoints:
-    #             # Calculate new cost
-    #             new_cost = cost_so_far[current] + self.heuristic(
-    #                 current.transform.location,
-    #                 next_wp.transform.location
-    #             )
-
-    #             # If this is a new node or we found a better path
-    #             if next_wp not in cost_so_far or new_cost < cost_so_far[next_wp]:
-    #                 cost_so_far[next_wp] = new_cost
-    #                 priority = new_cost + self.heuristic(
-    #                     next_wp.transform.location,
-    #                     goal.transform.location
-    #                 )
-    #                 heapq.heappush(frontier, ComparableWaypoint(next_wp, priority))
-    #                 came_from[next_wp] = current
-
-    #     # Reconstruct path
-    #     path = []
-    #     current_wp = current
-    #     while current_wp != start:
-    #         path.append(current_wp)
-    #         current_wp = came_from[current_wp]
-    #     path.append(start)
-    #     path.reverse()
-
-    #     print(f"Path found with {len(path)} waypoints")
-
-    #     smoothed_path = []
-    #     for i in range(len(path)-1):
-    #         start = path[i].transform.location
-    #         end = path[i+1].transform.location
-    #         num_points = int(start.distance(end) // 2.0)  # Add points every 2 meters
-    #         for t in np.linspace(0, 1, num_points + 2)[:-1]:
-    #             loc = start + t*(end - start)
-    #             smoothed_path.append(self.world.get_map().get_waypoint(loc))
-    #     # Visualize the complete path with thicker, more visible lines
-    #     for i in range(len(path)-1):
-    #         # Draw thick blue line between consecutive waypoints
-    #         begin = path[i].transform.location
-    #         end = path[i+1].transform.location
-
-    #         # Draw line slightly above ground
-    #         begin = begin + carla.Location(z=0.5)
-    #         end = end + carla.Location(z=0.5)
-
-    #         # Draw a thick blue line that persists
-    #         self.world.debug.draw_line(
-    #             begin, end,
-    #             thickness=0.5,
-    #             color=carla.Color(b=255, g=0, r=0),  # Blue
-    #             life_time=0.0,  # 0.0 means permanent until destroyed
-    #             persistent_lines=True
-    #         )
-
-    #         # Draw waypoint markers
-    #         self.world.debug.draw_point(
-    #             begin,
-    #             size=0.1,
-    #             color=carla.Color(b=255, g=255, r=255),  # White
-    #             life_time=0.0,
-    #             persistent_lines=True
-    #         )
-
-    #     # Draw final waypoint
-    #     self.world.debug.draw_point(
-    #         path[-1].transform.location + carla.Location(z=0.5),
-    #         size=0.1,
-    #         color=carla.Color(b=255, g=255, r=255),
-    #         life_time=0.0,
-    #         persistent_lines=True
-    #     )
-
-    #     # Draw start and end points more prominently
-    #     self.world.debug.draw_point(
-    #         path[0].transform.location + carla.Location(z=1.0),
-    #         size=0.2,
-    #         color=carla.Color(r=0, g=255, b=0),  # Green for start
-    #         life_time=0.0,
-    #         persistent_lines=True
-    #     )
-
-    #     self.world.debug.draw_point(
-    #         path[-1].transform.location + carla.Location(z=1.0),
-    #         size=0.2,
-    #         color=carla.Color(r=255, g=0, b=0),  # Red for end
-    #         life_time=0.0,
-    #         persistent_lines=True
-    #     )
-
-    #     return path
+    
     
     def a_star_search(self, start, goal):
-        """A* search algorithm to find shortest path"""
+        """A* search algorithm to find shortest path with cubic spline smoothing"""
         print("Starting A* search...")
 
         class ComparableWaypoint:
@@ -866,24 +769,33 @@ class GlobalPathPlanner:
         path.append(start)
         path.reverse()
 
-        # Convert to custom Waypoints with velocity information
-        path = self._add_velocity_to_path(path)
+        # Path Smoothing with Cubic Spline
+        if len(path) > 4:
+            # Extract x and y coordinates
+            path_points = np.array([[wp.transform.location.x, wp.transform.location.y] 
+                                   for wp in path])
 
-        print(f"Path found with {len(path)} waypoints")
+            # Parametric interpolation
+            t = np.linspace(0, 1, len(path_points))
+            cs_x = CubicSpline(t, path_points[:,0])
+            cs_y = CubicSpline(t, path_points[:,1])
 
-        # Visualization code
-        smoothed_path = []
+            # Generate more dense path points
+            t_new = np.linspace(0, 1, len(path)*2)
+            smoothed_points = np.column_stack((cs_x(t_new), cs_y(t_new)))
+
+            # Convert back to Carla waypoints
+            smoothed_path = []
+            for pt in smoothed_points:
+                loc = carla.Location(x=pt[0], y=pt[1], z=0)
+                wp = self.world.get_map().get_waypoint(loc)
+                if wp is not None:
+                    smoothed_path.append(wp)
+            path = smoothed_path
+
+        # Visualization code (same as before)
+        # Draw thick blue lines between waypoints
         for i in range(len(path)-1):
-            start = path[i].transform.location
-            end = path[i+1].transform.location
-            num_points = int(start.distance(end) // 2.0)  # Add points every 2 meters
-            for t in np.linspace(0, 1, num_points + 2)[:-1]:
-                loc = start + t*(end - start)
-                smoothed_path.append(self.world.get_map().get_waypoint(loc))
-
-        # Visualize the complete path with thicker, more visible lines
-        for i in range(len(path)-1):
-            # Draw thick blue line between consecutive waypoints
             begin = path[i].transform.location
             end = path[i+1].transform.location
 
@@ -935,7 +847,8 @@ class GlobalPathPlanner:
             persistent_lines=True
         )
 
-        return path
+        # Convert path to custom Waypoints with velocity
+        return self._add_velocity_to_path(path)
 
     def _add_velocity_to_path(self, path):
         """Add velocity information to path waypoints based on curvature"""
@@ -1153,159 +1066,63 @@ class CarEnv:
 
         except Exception as e:
             pass
-     # def get_reference_from_global_path(self, current_state):
-    #     """Get reference trajectory from global path"""
-    #     try:
-    #         if not self.global_path:
-    #             return np.zeros((self.mpc.N, 4))
-    
-    #         # Initialize index tracking
-    #         current_idx = self.current_path_index
-    #         min_dist = float('inf')
-    #         current_pos = np.array([current_state[0], current_state[1]])
-    
-    #         # Search 10 waypoints around current index
-    #         search_range = 10
-    #         start_idx = max(0, current_idx - search_range)
-    #         end_idx = min(len(self.global_path)-1, current_idx + search_range)
-    
-    #         for i in range(start_idx, end_idx):
-    #             wp = self.global_path[i]
-    #             dist = np.linalg.norm(current_pos - np.array([wp.transform.location.x, 
-    #                                                         wp.transform.location.y]))
-    #             if dist < min_dist:
-    #                 min_dist = dist
-    #                 current_idx = i
-    
-    #         self.current_path_index = current_idx
-    #         waypoints = []
-    #         lookahead = 3  # Skip every 3 waypoints for anticipation
-    
-    #         for i in range(self.mpc.N):
-    #             idx = min(current_idx + i*lookahead, len(self.global_path)-1)
-    #             wp = self.global_path[idx]
-    
-    #             # Calculate direction-based yaw
-    #             if idx < len(self.global_path)-1:
-    #                 next_wp = self.global_path[idx+1]
-    #                 dx = next_wp.transform.location.x - wp.transform.location.x
-    #                 dy = next_wp.transform.location.y - wp.transform.location.y
-    #                 target_yaw = np.arctan2(dy, dx)
-    #             else:
-    #                 target_yaw = wp.transform.rotation.yaw * np.pi / 180.0
-    
-    #             # Get velocity from the waypoint, with fallback options
-    #             try:
-    #                 velocity = wp.velocity
-    #             except AttributeError:
-    #                 # Option 1: Try to get velocity from waypoint's velocity component
-    #                 try:
-    #                     velocity = wp.transform.velocity
-    #                 except AttributeError:
-    #                     # Option 2: Calculate velocity from distance to next waypoint
-    #                     if idx < len(self.global_path)-1:
-    #                         next_wp = self.global_path[idx+1]
-    #                         dist = np.linalg.norm([
-    #                             next_wp.transform.location.x - wp.transform.location.x,
-    #                             next_wp.transform.location.y - wp.transform.location.y
-    #                         ])
-    #                         # Assuming a default time step of 0.1s between waypoints
-    #                         velocity = dist / 0.1
-    #                     else:
-    #                         # Option 3: Use a default velocity
-    #                         velocity = 5.0  # Default velocity in m/s
-    
-    #             waypoints.append([
-    #                 wp.transform.location.x,
-    #                 wp.transform.location.y,
-    #                 target_yaw,
-    #                 velocity
-    #             ])
-    
-    #         return np.array(waypoints)
-    
-        # except Exception as e:
-        #     print(f"Error in get_reference_from_global_path: {e}")
-        #     traceback.print_exc()
-        #     return np.zeros((self.mpc.N, 4))
-
-    # def get_next_waypoint(self, current_location, lookahead_distance=5.0):
-    #     """Get waypoint at a look-ahead distance with improved selection"""
-    #     if not self.global_path:
-    #         return None, self.current_path_index
-            
-    #     # Find closest point first
-    #     min_dist = float('inf')
-    #     closest_idx = self.current_path_index
-        
-    #     # Search in a window around current index
-    #     start_idx = max(0, self.current_path_index - self.waypoint_buffer)
-    #     end_idx = min(len(self.global_path), self.current_path_index + self.waypoint_buffer)
-        
-    #     for i in range(start_idx, end_idx):
-    #         wp = self.global_path[i]
-    #         dist = current_location.distance(wp.transform.location)
-    #         if dist < min_dist:
-    #             min_dist = dist
-    #             closest_idx = i
-        
-    #     # Look ahead from closest point
-    #     cumulative_distance = 0.0
-    #     current_wp = self.global_path[closest_idx]
-    #     target_idx = closest_idx
-        
-    #     for i in range(closest_idx, len(self.global_path)):
-    #         next_wp = self.global_path[i]
-    #         segment_distance = current_wp.transform.location.distance(next_wp.transform.location)
-    #         cumulative_distance += segment_distance
-            
-    #         if cumulative_distance >= lookahead_distance:
-    #             target_idx = i
-    #             break
-                
-    #         current_wp = next_wp
-        
-    #     return self.global_path[target_idx], target_idx
-
+   
     def get_reference_from_global_path(self, current_state):
-        """Get reference trajectory from global path with proper indexing"""
+        """Get reference trajectory from global path with advanced projection and indexing"""
         if not self.global_path:
             return np.zeros((self.mpc.N, 4))
-    
-        # Find nearest waypoint ahead of vehicle
+
+        # Current vehicle state
         current_pos = np.array([current_state[0], current_state[1]])
-        closest_idx = self.current_path_index
-        min_dist = float('inf')
-        
-        # Search forward from current index
+        current_yaw = current_state[2]
+
+        # Transformation matrices
+        cos_yaw = np.cos(current_yaw)
+        sin_yaw = np.sin(current_yaw)
+
+        # Initialize tracking variables
+        best_idx = self.current_path_index
+        best_projection = -np.inf
         search_range = 20  # Look 20 waypoints ahead
         end_idx = min(len(self.global_path), self.current_path_index + search_range)
-        
+
+        # Find best waypoint ahead using projection method
         for i in range(self.current_path_index, end_idx):
             wp = self.global_path[i]
-            dist = np.linalg.norm(current_pos - [wp.transform.location.x, wp.transform.location.y])
-            if dist < min_dist:
-                min_dist = dist
-                closest_idx = i
-    
-        self.current_path_index = closest_idx
-        waypoints = []
-        
+            dx = wp.transform.location.x - current_pos[0]
+            dy = wp.transform.location.y - current_pos[1]
+
+            # Convert to vehicle coordinates
+            local_x = dx * cos_yaw + dy * sin_yaw
+            local_y = -dx * sin_yaw + dy * cos_yaw
+
+            if local_x > 0:  # Only consider points ahead
+                # Projection that favors forward progress and penalizes lateral offset
+                projection = local_x - abs(local_y) * 0.1
+                if projection > best_projection:
+                    best_projection = projection
+                    best_idx = i
+
+        # Update current path index
+        self.current_path_index = best_idx
+
         # Collect N waypoints ahead
+        waypoints = []
         for i in range(self.mpc.N):
-            idx = min(closest_idx + i, len(self.global_path)-1)
+            # Ensure we don't go beyond path length
+            idx = min(best_idx + i, len(self.global_path) - 1)
             wp = self.global_path[idx]
-            
+
             # Use waypoint's actual rotation for yaw
             target_yaw = np.radians(wp.transform.rotation.yaw)
-            
+
             waypoints.append([
                 wp.transform.location.x,
                 wp.transform.location.y,
                 target_yaw,
                 wp.velocity  # From custom Waypoint class
             ])
-        
+
         return np.array(waypoints)
 
     def get_next_waypoint(self, current_location, lookahead_distance=10.0):  # Reduced lookahead
@@ -1375,82 +1192,6 @@ class CarEnv:
         print("Warning: Could not find end point far enough apart")
         return start_point,random.choice(spawn_points)
     
-    # def generate_global_path(self):
-    #     """Generate a new global path using A*"""
-    #     try:
-    #         start_wp, end_wp = self.select_distant_points()
-
-    #         # Draw start and end markers more prominently
-    #         self.world.debug.draw_string(
-    #             start_wp.location + carla.Location(z=2.0),
-    #             'START',
-    #             color=carla.Color(r=0, g=255, b=0),
-    #             life_time=20.0
-    #         )
-    #         self.world.debug.draw_string(
-    #             end_wp.location + carla.Location(z=2.0),
-    #             'END',
-    #             color=carla.Color(r=255, g=0, b=0),
-    #             life_time=20.0
-    #         )
-
-    #         # Get waypoints for start and end
-    #         start_waypoint = self.world.get_map().get_waypoint(start_wp.location)
-    #         end_waypoint = self.world.get_map().get_waypoint(end_wp.location)
-
-    #         # Get the A* path
-    #         print("Calculating A* path...")
-    #         self.global_path = self.path_planner.a_star_search(start_waypoint, end_waypoint)
-    #         print(f"Path found with {len(self.global_path)} waypoints")
-
-    #         # Visualize the path
-    #         if self.global_path:
-    #             print("Visualizing path...")
-    #             # Draw lines between consecutive waypoints
-    #             for i in range(len(self.global_path)-1):
-    #                 # Current and next waypoint locations
-    #                 current = self.global_path[i].transform.location
-    #                 next_wp = self.global_path[i+1].transform.location
-
-    #                 # Draw thick blue line
-    #                 self.world.debug.draw_line(
-    #                     current + carla.Location(z=0.5),  # Raise slightly above ground
-    #                     next_wp + carla.Location(z=0.5),
-    #                     thickness=0.5,  # Thicker line
-    #                     color=carla.Color(b=255, g=0, r=0),  # Pure blue
-    #                     life_time=20.0,
-    #                     persistent_lines=True
-    #                 )
-
-    #                 # Draw waypoint markers
-    #                 self.world.debug.draw_point(
-    #                     current + carla.Location(z=0.5),
-    #                     size=0.1,
-    #                     color=carla.Color(b=255, g=255, r=255),  # White dots
-    #                     life_time=20.0,
-    #                     persistent_lines=True
-    #                 )
-
-    #             # Draw final waypoint
-    #             self.world.debug.draw_point(
-    #                 self.global_path[-1].transform.location + carla.Location(z=0.5),
-    #                 size=0.1,
-    #                 color=carla.Color(b=255, g=255, r=255),
-    #                 life_time=20.0,
-    #                 persistent_lines=True
-    #             )
-
-    #             print("Path visualization complete")
-    #         else:
-    #             print("No path found!")
-
-    #         self.current_path_index = 0
-    #         return True
-
-    #     except Exception as e:
-    #         print(f"Error in generate_global_path: {e}")
-    #         traceback.print_exc()
-    #         return False
 
     def generate_global_path(self):
         """Generate a new global path using A*"""
@@ -2129,7 +1870,6 @@ class CarEnv:
 
             try:
                 # Get reference trajectory from global path
-
                 next_wp, next_idx = self.get_next_waypoint(self.vehicle.get_location())
                 if next_wp:
                     self.current_path_index = next_idx
