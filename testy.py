@@ -1,31 +1,40 @@
+# Standard library imports
 import os
 import sys
 import glob
 import time
 import random
-import numpy as np
-import cv2
-import weakref
 import math
+import weakref
+import traceback
+import json
 from collections import deque
+from threading import Thread
+from datetime import datetime
+from typing import List, Optional, Union, Dict, Tuple
+import heapq
+
+# Third-party imports
+import numpy as np 
+# Deep learning imports
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions import MultivariateNormal
 import torch.nn.functional as F
+from torch.distributions import MultivariateNormal
 from torch.utils.tensorboard import SummaryWriter
-from threading import Thread
-from tqdm import tqdm
-import requests 
+
+# Computer vision and visualization
+import cv2
 import pygame
 from pygame import surfarray
-import traceback
+
+# Optimization and control
 import casadi as ca
-import json
-from datetime import datetime
-from typing import List, Optional, Union,Dict
-import heapq
-from scipy.interpolate import CubicSpline
+
+# Other utilities
+import requests
+from tqdm import tqdm
 
 def download_weights(url, save_path):
     """Download weights if they don't exist"""
@@ -218,357 +227,261 @@ class PPOMemory:
 
 
 
+from scipy.linalg import solve
+from functools import partial
+
 class MPCController:
-    def __init__(self, dt=0.05, N=30):
-        """Initialize MPC controller with prediction horizon N and timestep dt"""
+    def __init__(self, dt=0.1, N=50):
+        """Initialize MPC controller with iLQR"""
         self.dt = dt
         self.N = N
         
-        # State and control dimensions
-        self.nx = 4  # [x, y, yaw, v]
-        self.nu = 2  # [steering, throttle]
-        
-        # Calculate total number of variables
-        self.n_states = self.nx
-        self.n_controls = self.nu
-        self.n_vars = (self.N + 1) * self.n_states + self.N * self.n_controls
-        
-        # Calculate number of constraints
-        self.n_equality_constraints = (self.N + 1) * self.n_states  # Dynamic constraints
-        
-        # MPC parameters for 4-dimensional state
-        self.Q = np.diag([30.0, 30.0, 10.0, 5.0])  # Higher position tracking priority
-        self.R = np.diag([0.05, 0.05])  # Lower control penalty
-
+        # State dimensions [x, y, v, phi, beta]
+        self.nx = 5
+        self.nu = 3  # [steering, throttle, brake]
         
         # Vehicle parameters
         self.L = 2.9  # Wheelbase
+        self.lr = 1.538  # Distance from rear axle to CoM
+        
+        # Cost weights - Heavily weighted for forward motion and path following
+        self.Q = np.diag([100.0, 100.0, 50.0, 20.0, 1.0])  # Increased weights
+        self.R = np.diag([1.0, 0.1, 1.0])  # Higher penalty for brake
+        
+        # Control bounds with minimum throttle
         self.bounds = {
-            'steer': [-1.0, 1.0],
-            'throttle': [0, 1.0],
-            'v_max': 15.0,  # Maximum velocity in m/s
-            'v_min': 0.0,   # Minimum velocity in m/s
-            'max_yaw_rate': 3.14 # Maximum yaw rate (rad/s)
+            'steer': [-0.8, 0.8],
+            'throttle': [0.2, 0.8],  # Minimum throttle of 0.2
+            'brake': [0.0, 1.0],
+            'v_max': 12.0,
+            'v_min': 0.0,  # Don't allow negative velocity
         }
         
         # Safety parameters
-        self.safety_distance = 3.0  # meters
-        self.object_weights = {
-            'person': 5.0,      # Highest priority
-            'vehicle': 4.0,
-            'bicycle': 4.5,
-            'motorcycle': 4.5
-        }
+        self.safety_distance = 15.0
+        self.comfort_brake_distance = 30.0
         
-        # Initialize solution guess
-        self.x0 = np.zeros(self.n_vars)
-        
-        # Setup optimization problem
-        self._setup_optimization()
-
-    def _setup_optimization(self):
-        """Setup MPC optimization problem using CasADi with terminal cost"""
-        try:
-            # State variables
-            x = ca.SX.sym('x')
-            y = ca.SX.sym('y')
-            yaw = ca.SX.sym('yaw')
-            v = ca.SX.sym('v')
-            state = ca.vertcat(x, y, yaw, v)
-
-            # Control variables
-            steer = ca.SX.sym('steer')
-            throttle = ca.SX.sym('throttle')
-            controls = ca.vertcat(steer, throttle)
-
-            # Decision variables
-            X = ca.SX.sym('X', self.n_states, self.N + 1)
-            U = ca.SX.sym('U', self.n_controls, self.N)
-
-            # Parameters (current state and reference trajectory)
-            P = ca.SX.sym('P', self.n_states + self.n_states * self.N)
-
-            safe_steer = ca.fmax(ca.fmin(steer, 1.0), -1.0)
-            yaw_rate = v * ca.tan(safe_steer) / (self.L + 1e-3)  # Prevent division by zero
-            rhs = ca.vertcat(
-                v * ca.cos(yaw + 0.5*self.dt*yaw_rate),  # Anticipate rotation
-                v * ca.sin(yaw + 0.5*self.dt*yaw_rate),
-                yaw_rate,
-                ca.fmax(5*throttle - 0.2*v**2, -5.0)  # Limit deceleration
-            )
-
-
-            # Create the integration function
-            f = ca.Function('f', [state, controls], [rhs])
-
-            # Initialize constraint vectors
-            g = []
-
-            # Objective function
-            obj = 0
-
-            # Initial state constraint
-            g.append(X[:, 0] - P[0:self.n_states])
-
-            # Dynamic constraints and cost for each step
-            for k in range(self.N):
-                # State error cost
-                ref_idx = self.n_states + k * self.n_states
-                state_error = X[:, k] - P[ref_idx:ref_idx + self.n_states]
-                obj += ca.mtimes(state_error.T, ca.mtimes(self.Q, state_error))
-
-                # Control cost
-                obj += ca.mtimes(U[:, k].T, ca.mtimes(self.R, U[:, k]))
-
-                # Next state based on vehicle dynamics
-                state_next = X[:, k] + self.dt * f(X[:, k], U[:, k])
-                g.append(X[:, k + 1] - state_next)
-
-                # Yaw rate constraint if k > 0
-                if k > 0:
-                    yaw_rate = (X[2, k] - X[2, k-1]) / self.dt
-                    g.append(yaw_rate)
-
-            # Add terminal cost
-            terminal_error = X[:, -1] - P[-self.n_states:]
-            obj += 10 * ca.mtimes(terminal_error.T, ca.mtimes(self.Q, terminal_error))
-
-            # Create optimization variables
-            opt_vars = ca.vertcat(
-                ca.reshape(X, -1, 1),
-                ca.reshape(U, -1, 1)
-            )
-
-            # Concatenate constraints
-            g = ca.vertcat(*g)
-
+        # Initialize control smoothing
+        self.last_controls = None
+        self.control_smoothing = 0.3  # Reduced smoothing for more responsive control
         
 
-            # Solver options
-            opts = {
-            'ipopt.print_level': 0,
-            'ipopt.max_iter': 500,  # Increased iterations
-            'ipopt.tol': 1e-3,      # Relaxed tolerance
-            'ipopt.constr_viol_tol': 1e-3,
-            'ipopt.acceptable_tol': 1e-2,
-            'ipopt.linear_solver': 'mumps',  # Better for large problems
-            'ipopt.nlp_scaling_method': 'gradient-based',
-            'print_time': 0
-            }
 
-            epsilon = ca.SX.sym('epsilon', self.n_constraints)
-            relaxed_g = self.g + epsilon
-            obj += 1e4 * ca.dot(epsilon, epsilon)  # Constraint violation penalty
+    def stage_cost(self, state, control, reference, detected_objects):
+        """Modified cost function for better tracking"""
+        # Path following error
+        path_error = state[:2] - reference[:2]
+        path_cost = np.sum(path_error**2)
+        
+        # Velocity tracking with minimum speed requirement
+        vel_error = state[2] - max(reference[2], 2.0)  # Minimum speed of 2 m/s
+        vel_cost = vel_error**2
+        
+        # Heading error with wrapping
+        heading_error = state[3] - reference[3]
+        heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
+        heading_cost = heading_error**2
+        
+        # Control cost with preference for throttle over brake
+        control_cost = control[0]**2 + 0.1*control[1]**2 + 2.0*control[2]**2
+        
+        # Additional cost for low speeds
+        speed_penalty = 10.0 * np.exp(-state[2])  # Penalize low speeds
+        
+        return 100.0*path_cost + 50.0*vel_cost + 20.0*heading_cost + control_cost + speed_penalty
+
+    def vehicle_dynamics(self, state, controls):
+        """Continuous time vehicle dynamics"""
+        x, y, v, phi, beta = state
+        steering, throttle, brake = controls
+        
+        # Clip controls
+        steering = np.clip(steering, -1.0, 1.0)
+        throttle = np.clip(throttle, 0.0, 1.0)
+        brake = np.clip(brake, 0.0, 1.0)
+        
+        # Dynamics
+        dx = v * np.cos(phi + beta)
+        dy = v * np.sin(phi + beta)
+        dphi = v * np.sin(beta) / self.lr
+        
+        # Simplified acceleration model with air resistance
+        dv = 5.0 * throttle - 0.2 * v * v - 10.0 * brake
+        
+        # Steering dynamics
+        dbeta = -0.6 * beta + 0.4 * steering
+        
+        return np.array([dx, dy, dv, dphi, dbeta])
+
+    def discrete_dynamics(self, state, controls):
+        """Discrete time dynamics using Euler integration"""
+        return state + self.vehicle_dynamics(state, controls) * self.dt
+
+    def get_jacobians(self, state, control):
+        """Compute Jacobians numerically"""
+        eps = 1e-6
+        fx = np.zeros((self.nx, self.nx))
+        fu = np.zeros((self.nx, self.nu))
+        
+        # Compute state Jacobian
+        for i in range(self.nx):
+            state_perturbed = state.copy()
+            state_perturbed[i] += eps
+            fx[:, i] = (self.discrete_dynamics(state_perturbed, control) - 
+                       self.discrete_dynamics(state, control)) / eps
             
-            # Create solver with relaxation
-            nlp = {'x': ca.vertcat(self.opt_vars, epsilon), 
-                   'f': obj, 
-                   'g': relaxed_g, 
-                   'p': self.P}
-            self.solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
+        # Compute control Jacobian
+        for i in range(self.nu):
+            control_perturbed = control.copy()
+            control_perturbed[i] += eps
+            fu[:, i] = (self.discrete_dynamics(state, control_perturbed) - 
+                       self.discrete_dynamics(state, control)) / eps
             
+        return fx, fu
 
-            # Store variables for later use
-            self.X = X
-            self.U = U
-            self.f = f
-            self.opt_vars = opt_vars
-            self.n_constraints = g.size1()
+    def forward_pass(self, x0, u_traj, k, K):
+        """Forward pass for iLQR"""
+        x_traj = np.zeros((self.N + 1, self.nx))
+        x_traj[0] = x0  # Changed from .at[0].set()
+        u_new = np.zeros_like(u_traj)
 
-            print("MPC optimization problem setup completed successfully")
-            return True
+        for t in range(self.N):
+            dx = x_traj[t] - x0
+            u_new[t] = u_traj[t] + k[t] + K[t] @ dx  # Changed from .at[t].set()
+            x_traj[t+1] = self.discrete_dynamics(x_traj[t], u_new[t])  # Changed from .at[t+1].set()
 
-        except Exception as e:
-            print(f"Error in MPC setup_optimization: {e}")
-            traceback.print_exc()
-            return False
+        return x_traj, u_new
 
-    def solve(self, current_state, reference_trajectory, detected_objects):
-        """ Solve MPC optimization problem with enhanced warm-start and velocity-aware shifting """
-        try:
-            # Convert current state to numpy array
-            current_state = np.array(current_state[:4], dtype=np.float64).reshape(-1)
+    def backward_pass(self, x_traj, u_traj, reference_traj, detected_objects):
+        """Backward pass for iLQR"""
+        k = np.zeros((self.N, self.nu))
+        K = np.zeros((self.N, self.nu, self.nx))
 
-            # Ensure reference trajectory has correct dimensions
-            if not isinstance(reference_trajectory, np.ndarray):
-                reference_trajectory = np.array(reference_trajectory, dtype=np.float64)
+        V_x = np.zeros(self.nx)
+        V_xx = np.zeros((self.nx, self.nx))
 
-            # If reference trajectory is a single point, extend it to N+1 points
-            if reference_trajectory.shape[0] == 1:
-                reference_trajectory = np.tile(reference_trajectory, (self.N + 1, 1))
-            elif reference_trajectory.shape[1] > 4:
-                reference_trajectory = reference_trajectory[:, :4]
+        for t in range(self.N-1, -1, -1):
+            state = x_traj[t]
+            control = u_traj[t]
 
-            # Ensure we have exactly N+1 timesteps
-            if reference_trajectory.shape[0] < self.N + 1:
-                last_point = reference_trajectory[-1:]
-                points_needed = self.N + 1 - reference_trajectory.shape[0]
-                extension = np.tile(last_point, (points_needed, 1))
-                reference_trajectory = np.vstack([reference_trajectory, extension])
-            elif reference_trajectory.shape[0] > self.N + 1:
-                reference_trajectory = reference_trajectory[:(self.N + 1), :]
+            f_x, f_u = self.get_jacobians(state, control)
 
-            # Enhanced warm-start initialization
-            if not hasattr(self, 'x0') or self.x0 is None:
-                # Initialize with linear extrapolation using current velocity and heading
-                self.x0 = np.zeros(self.n_vars)
-                for k in range(self.N + 1):
-                    self.x0[k*self.n_states:(k+1)*self.n_states] = [
-                        current_state[0] + k*self.dt*current_state[3]*np.cos(current_state[2]),
-                        current_state[1] + k*self.dt*current_state[3]*np.sin(current_state[2]),
-                        current_state[2],
-                        current_state[3]
-                    ]
-            else:
-                # Enhanced state and control shifting with velocity consideration
-                prev_states = self.x0[:(self.N+1)*self.n_states].reshape(self.N+1, self.n_states)
-                prev_controls = self.x0[(self.N+1)*self.n_states:].reshape(self.N, self.n_controls)
+            # Compute Q terms
+            Q_x = V_x @ f_x
+            Q_u = V_x @ f_u
+            Q_xx = f_x.T @ V_xx @ f_x
+            Q_uu = f_u.T @ V_xx @ f_u + self.R
+            Q_ux = f_u.T @ V_xx @ f_x
 
-                # Velocity-aware state shifting
-                current_v = current_state[3]
-                new_states = np.zeros_like(prev_states)
-                new_states[0] = current_state  # Set first state to current state
-
-                for k in range(1, self.N + 1):
-                    # Propagate state using current velocity and previous heading
-                    new_states[k] = [
-                        new_states[k-1][0] + current_v*self.dt*np.cos(new_states[k-1][2]),
-                        new_states[k-1][1] + current_v*self.dt*np.sin(new_states[k-1][2]),
-                        new_states[k-1][2],
-                        current_v
-                    ]
-
-                # Shift controls forward and repeat last control
-                prev_controls = np.roll(prev_controls, -self.n_controls, axis=0)
-                prev_controls[-1] = prev_controls[-2]
-
-                # Update x0 with new states and controls
-                self.x0 = np.concatenate([new_states.flatten(), prev_controls.flatten()])
-
-            # Calculate expected parameter vector size
-            expected_param_size = self.n_states + self.N * self.n_states
-
-            # Create parameter vector with only N reference points
-            param_vector = np.concatenate([
-                current_state,
-                reference_trajectory[:self.N].reshape(-1)
-            ]).astype(np.float64)
-
-            # Verify parameter vector size
-            if param_vector.size != expected_param_size:
-                print(f"Warning: Parameter vector size mismatch. Expected {expected_param_size}, got {param_vector.size}")
-                param_vector = param_vector[:expected_param_size]
-
-            # Initialize bounds
-            lbx = np.zeros(self.n_vars)
-            ubx = np.zeros(self.n_vars)
-
-            # State bounds
-            for i in range(self.N + 1):
-                lbx[i * self.n_states:(i + 1) * self.n_states] = [-np.inf, -np.inf, -2*np.pi, self.bounds['v_min']]
-                ubx[i * self.n_states:(i + 1) * self.n_states] = [np.inf, np.inf, 2*np.pi, self.bounds['v_max']]
-
-            # Control bounds
-            control_start = (self.N + 1) * self.n_states
-            for i in range(self.N):
-                idx = control_start + i * self.n_controls
-                lbx[idx:idx + self.n_controls] = [self.bounds['steer'][0], self.bounds['throttle'][0]]
-                ubx[idx:idx + self.n_controls] = [self.bounds['steer'][1], self.bounds['throttle'][1]]
-
-            # Constraint bounds
-            lbg = np.zeros(self.n_constraints)
-            ubg = np.zeros(self.n_constraints)
-
-            # Dynamic constraints (equality)
-            lbg[:self.n_equality_constraints] = 0
-            ubg[:self.n_equality_constraints] = 0
-
-            # Yaw rate constraints
-            if self.N > 1:
-                yaw_rate_start = self.n_equality_constraints
-                for i in range(self.N - 1):
-                    lbg[yaw_rate_start + i] = -self.bounds['max_yaw_rate']
-                    ubg[yaw_rate_start + i] = self.bounds['max_yaw_rate']
-
+            # Compute gains
             try:
-                # Solve the optimization problem
-                sol = self.solver(
-                    x0=self.x0,
-                    lbx=lbx,
-                    ubx=ubx,
-                    lbg=lbg,
-                    ubg=ubg,
-                    p=param_vector
-                )
+                k_t = -np.linalg.solve(Q_uu, Q_u)
+                K_t = -np.linalg.solve(Q_uu, Q_ux)
+            except np.linalg.LinAlgError:
+                # If matrix is singular, use pseudo-inverse
+                k_t = -np.linalg.pinv(Q_uu) @ Q_u
+                K_t = -np.linalg.pinv(Q_uu) @ Q_ux
 
-                # Check if solution was found
-                if self.solver.stats()['success']:
-                    opt_vars = sol['x'].full().flatten()
-                    control_start = (self.N + 1) * self.n_states
-                    optimal_control = opt_vars[control_start:control_start + self.n_controls]
-                    self.x0 = opt_vars
+            k[t] = k_t  # Changed from .at[t].set()
+            K[t] = K_t  # Changed from .at[t].set()
 
-                    # Store the last successful control
-                    self.last_control = optimal_control
-                    return optimal_control
-                else:
-                    print("MPC failed, using previous control")
-                    return self.last_control if hasattr(self, 'last_control') else np.array([0.0, -0.5])
+            # Update value function derivatives
+            V_x = Q_x + K_t.T @ Q_uu @ k_t
+            V_xx = Q_xx + K_t.T @ Q_uu @ K_t
 
-            except Exception as e:
-                print(f"MPC solver error: {e}")
-                return np.array([0.0, -0.5])
+        return k, K
+    
+    def solve(self, current_state, reference_trajectory, detected_objects):
+        """Solve MPC problem using iLQR"""
+        try:
+            # Extract relevant state variables [x, y, v, phi, beta]
+            if len(current_state) > 5:
+                x = current_state[0]
+                y = current_state[1]
+                v = current_state[2]
+                phi = current_state[3]
+                beta = current_state[4] if len(current_state) > 4 else 0.0
+                
+                reduced_state = np.array([x, y, v, phi, beta])
+            else:
+                reduced_state = current_state
+
+            # Print current state for debugging
+            print(f"Current state: v={reduced_state[2]:.2f} m/s, phi={np.degrees(reduced_state[3]):.2f}°")
+            
+            # Get heading to next reference point
+            if len(reference_trajectory) > 0:
+                target = reference_trajectory[0]
+                dx = target[0] - reduced_state[0]
+                dy = target[1] - reduced_state[1]
+                target_heading = np.arctan2(dy, dx)
+                heading_error = target_heading - reduced_state[3]
+                heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
+                print(f"Target heading: {np.degrees(target_heading):.2f}°, Error: {np.degrees(heading_error):.2f}°")
+            
+            # Force initial movement
+            if reduced_state[2] < 0.5:  # If speed is less than 0.5 m/s
+                print("Forcing initial forward motion")
+                return np.array([0.0, 0.4, 0.0])  # Apply significant throttle
+            
+            # Initialize trajectories
+            x_traj = np.zeros((self.N + 1, self.nx))
+            u_traj = np.zeros((self.N, self.nu))
+            x_traj[0] = reduced_state
+            
+            # Safety checks for obstacles
+            min_obj_distance = float('inf')
+            for obj in detected_objects:
+                dist = np.sqrt(np.sum((reduced_state[:2] - obj[:2])**2))
+                min_obj_distance = min(dist, min_obj_distance)
+            
+            if min_obj_distance < self.safety_distance:
+                print("Emergency brake - Object too close!")
+                return np.array([0.0, 0.0, 1.0])
+            
+            # Perform iLQR iterations
+            for _ in range(5):
+                k, K = self.backward_pass(x_traj, u_traj, reference_trajectory, detected_objects)
+                x_traj_new, u_traj_new = self.forward_pass(reduced_state, u_traj, k, K)
+                x_traj = x_traj_new
+                u_traj = u_traj_new
+            
+            # Get raw control action
+            raw_control = u_traj[0]
+            
+            # Apply bounds
+            control = np.array([
+                np.clip(raw_control[0], self.bounds['steer'][0], self.bounds['steer'][1]),
+                np.clip(raw_control[1], self.bounds['throttle'][0], self.bounds['throttle'][1]),
+                np.clip(raw_control[2], self.bounds['brake'][0], self.bounds['brake'][1])
+            ])
+            
+            # Ensure minimum forward motion
+            if control[1] < self.bounds['throttle'][0]:
+                control[1] = self.bounds['throttle'][0]
+            
+            # Don't brake while accelerating
+            if control[1] > 0.1:
+                control[2] = 0.0
+            
+            # Apply control smoothing
+            if self.last_controls is not None:
+                control = self.control_smoothing * self.last_controls + \
+                         (1 - self.control_smoothing) * control
+            
+            # Store controls for next iteration
+            self.last_controls = control.copy()
+            
+            # Print control values for debugging
+            print(f"Controls: steer={control[0]:.2f}, throttle={control[1]:.2f}, brake={control[2]:.2f}")
+            
+            return control
 
         except Exception as e:
             print(f"Error in MPC solve: {e}")
             traceback.print_exc()
-            return np.array([0.0, -0.5])
-
-    def adjust_for_turns(self, reference_trajectory):
-        max_lat_accel = 2.5  # m/s²
-        for i in range(1, len(reference_trajectory)):
-            dx = reference_trajectory[i][0] - reference_trajectory[i-1][0]
-            dy = reference_trajectory[i][1] - reference_trajectory[i-1][1]
-            dist = np.hypot(dx, dy)
-            if dist < 0.1:
-                continue
-                
-            curvature = abs(reference_trajectory[i][2] - reference_trajectory[i-1][2]) / dist
-            max_speed = np.sqrt(max_lat_accel / (curvature + 1e-3))  # Avoid division by zero
-            reference_trajectory[i][3] = min(reference_trajectory[i][3], max_speed)
-
-    def solve_with_obstacle_avoidance(self, current_state, reference_trajectory, detected_objects):
-        # Enhanced emergency braking logic
-        emergency_brake = False
-        for obj in detected_objects:
-            if obj['depth'] < self.safety_distance:
-                rel_speed = current_state[3] - obj['velocity']
-                ttc = obj['depth'] / (rel_speed + 1e-3)
-                if ttc < 2.0:  # 2 second time-to-collision threshold
-                    emergency_brake = True
-                    break
-                
-        if emergency_brake:
-            # Smooth braking with steering adjustment
-            steer = -0.1 * np.sign(current_state[1])  # Center in lane
-            throttle = -1.0  # Full brake
-            return np.array([steer, throttle])
+            return np.array([0.0, 0.3, 0.0])  # Safe fallback with forward motion
         
-        # Normal MPC solve with recovery
-        solution = self.solve(current_state, reference_trajectory, detected_objects)
-        
-        if solution is None:
-            # Graceful degradation: path-relative PD control
-            path_error = reference_trajectory[0,1]  # Lateral error
-            yaw_error = reference_trajectory[0,2] - current_state[2]
-            
-            steer = 0.5 * path_error + 0.8 * yaw_error
-            throttle = 0.3 * (reference_trajectory[0,3] - current_state[3])
-            
-            return np.clip([steer, throttle], [-1, 0], [1, 1])
-        
-        return solution
-
 
 class PPOAgent:
     def __init__(self, state_dim, action_dim):
@@ -752,10 +665,8 @@ class GlobalPathPlanner:
             })
         return topology
 
-    
-    
     def a_star_search(self, start, goal):
-        """A* search algorithm to find shortest path with cubic spline smoothing"""
+        """A* search algorithm to find shortest path"""
         print("Starting A* search...")
 
         class ComparableWaypoint:
@@ -810,33 +721,24 @@ class GlobalPathPlanner:
         path.append(start)
         path.reverse()
 
-        # Path Smoothing with Cubic Spline
-        if len(path) > 4:
-            # Extract x and y coordinates
-            path_points = np.array([[wp.transform.location.x, wp.transform.location.y] 
-                                   for wp in path])
+        # Convert to custom Waypoints with velocity information
+        path = self._add_velocity_to_path(path)
 
-            # Parametric interpolation
-            t = np.linspace(0, 1, len(path_points))
-            cs_x = CubicSpline(t, path_points[:,0])
-            cs_y = CubicSpline(t, path_points[:,1])
+        print(f"Path found with {len(path)} waypoints")
 
-            # Generate more dense path points
-            t_new = np.linspace(0, 1, len(path)*2)
-            smoothed_points = np.column_stack((cs_x(t_new), cs_y(t_new)))
-
-            # Convert back to Carla waypoints
-            smoothed_path = []
-            for pt in smoothed_points:
-                loc = carla.Location(x=pt[0], y=pt[1], z=0)
-                wp = self.world.get_map().get_waypoint(loc)
-                if wp is not None:
-                    smoothed_path.append(wp)
-            path = smoothed_path
-
-        # Visualization code (same as before)
-        # Draw thick blue lines between waypoints
+        # Visualization code
+        smoothed_path = []
         for i in range(len(path)-1):
+            start = path[i].transform.location
+            end = path[i+1].transform.location
+            num_points = int(start.distance(end) // 2.0)  # Add points every 2 meters
+            for t in np.linspace(0, 1, num_points + 2)[:-1]:
+                loc = start + t*(end - start)
+                smoothed_path.append(self.world.get_map().get_waypoint(loc))
+
+        # Visualize the complete path with thicker, more visible lines
+        for i in range(len(path)-1):
+            # Draw thick blue line between consecutive waypoints
             begin = path[i].transform.location
             end = path[i+1].transform.location
 
@@ -888,8 +790,7 @@ class GlobalPathPlanner:
             persistent_lines=True
         )
 
-        # Convert path to custom Waypoints with velocity
-        return self._add_velocity_to_path(path)
+        return path
 
     def _add_velocity_to_path(self, path):
         """Add velocity information to path waypoints based on curvature"""
@@ -983,7 +884,7 @@ class CarEnv:
         self.display = None
         self.clock = None
         self.init_pygame_display()
-
+        self.map = None
         self.global_path = []
         self.current_path_index = 0
         self.target_destination = None
@@ -1010,7 +911,7 @@ class CarEnv:
         self.action_dim = 2  # steering and throttle
         
         # Initialize both controllers
-        self.mpc = MPCController()
+        self.mpc = MPCController(dt=0.1, N=50) 
         self.agent = PPOAgent(self.state_dim, self.action_dim)  # Initialize PPO agent
         
         # Controller management
@@ -1107,74 +1008,38 @@ class CarEnv:
 
         except Exception as e:
             pass
-   
+
     def get_reference_from_global_path(self, current_state):
-        """Get reference trajectory from global path with advanced projection, coordinate transformation and smoothing"""
+        """Generate reference trajectory from current position"""
         if not self.global_path:
-            return np.zeros((self.mpc.N, 4))
+            return np.zeros((self.mpc.N, 5))
 
-        # Current vehicle state
-        current_pos = np.array([current_state[0], current_state[1]])
-        current_yaw = current_state[2]
+        reference = []
+        current_idx = self.current_path_index
 
-        # Transformation matrices
-        cos_yaw = np.cos(current_yaw)
-        sin_yaw = np.sin(current_yaw)
-
-        # Initialize tracking variables
-        best_idx = self.current_path_index
-        best_projection = -np.inf
-        search_range = 20  # Look 20 waypoints ahead
-        end_idx = min(len(self.global_path), self.current_path_index + search_range)
-
-        # Find best waypoint ahead using projection method
-        for i in range(self.current_path_index, end_idx):
-            wp = self.global_path[i]
-            dx = wp.transform.location.x - current_pos[0]
-            dy = wp.transform.location.y - current_pos[1]
-
-            # Convert to vehicle coordinates
-            local_x = dx * cos_yaw + dy * sin_yaw
-            local_y = -dx * sin_yaw + dy * cos_yaw
-
-            if local_x > 0:  # Only consider points ahead
-                # Projection that favors forward progress and penalizes lateral offset
-                projection = local_x - abs(local_y) * 0.1
-                if projection > best_projection:
-                    best_projection = projection
-                    best_idx = i
-
-        # Update current path index
-        self.current_path_index = best_idx
-
-        # Transform global path points to vehicle-relative coordinates and collect N waypoints
-        path_local = []
         for i in range(self.mpc.N):
-            # Ensure we don't go beyond path length
-            idx = min(best_idx + i, len(self.global_path) - 1)
+            idx = min(current_idx + i, len(self.global_path)-1)
             wp = self.global_path[idx]
 
-            # Transform to vehicle-relative coordinates
-            dx = wp.transform.location.x - current_pos[0]
-            dy = wp.transform.location.y - current_pos[1]
-            local_x = dx * np.cos(-current_yaw) - dy * np.sin(-current_yaw)
-            local_y = dx * np.sin(-current_yaw) + dy * np.cos(-current_yaw)
+            # Calculate target heading from path
+            next_idx = min(idx + 1, len(self.global_path)-1)
+            next_wp = self.global_path[next_idx]
+            dx = next_wp.transform.location.x - wp.transform.location.x
+            dy = next_wp.transform.location.y - wp.transform.location.y
+            target_heading = np.arctan2(dy, dx)
 
-            # Calculate relative yaw
-            target_yaw = np.radians(wp.transform.rotation.yaw) - current_yaw
+            # Set target speed (adjust these values as needed)
+            target_speed = 5.0  # m/s (about 18 km/h)
 
-            path_local.append([local_x, local_y, target_yaw, wp.velocity])
+            reference.append([
+                wp.transform.location.x,
+                wp.transform.location.y,
+                target_speed,
+                target_heading,
+                0.0  # Target slip angle
+            ])
 
-        path_local = np.array(path_local)
-
-        # Apply moving average smoothing
-        smoothed = np.zeros_like(path_local)
-        for i in range(len(path_local)):
-            start = max(0, i-1)
-            end = min(len(path_local), i+2)
-            smoothed[i] = np.mean(path_local[start:end], axis=0)
-
-        return smoothed
+        return np.array(reference)
 
     def get_next_waypoint(self, current_location, lookahead_distance=10.0):  # Reduced lookahead
         """Get next target waypoint with lane alignment"""
@@ -1242,7 +1107,7 @@ class CarEnv:
 
         print("Warning: Could not find end point far enough apart")
         return start_point,random.choice(spawn_points)
-    
+
 
     def generate_global_path(self):
         """Generate a new global path using A*"""
@@ -1326,53 +1191,6 @@ class CarEnv:
             print(f"Error in generate_global_path: {e}")
             traceback.print_exc()
             return False
-
-
-    def get_reference_trajectory(self,current_state):
-        waypoints = []
-        waypoint = self.world.get_map().get_waypoint(self.vehicle.get_location())
-
-        for i in range(self.mpc.N):
-            # Get next 4 waypoints at 1m intervals
-            next_waypoints = waypoint.next(1.0) 
-            if not next_waypoints:
-                break
-
-            waypoint = next_waypoints[0]
-
-            # Calculate curvature-based speed
-            road_curve = self.calculate_road_curvature(waypoint)
-            target_speed = max(5.0, 20.0 - 15.0*road_curve)  # Reduce speed in curves
-
-            waypoints.append([
-                waypoint.transform.location.x,
-                waypoint.transform.location.y,
-                waypoint.transform.rotation.yaw * np.pi / 180.0,
-                target_speed  # Adaptive speed
-            ])
-
-        return np.array(waypoints)
-
-    def calculate_road_curvature(self, waypoint, lookahead=5):
-        """Estimate road curvature using multiple waypoints"""
-        points = []
-        current_wp = waypoint
-        for _ in range(lookahead):
-            next_wps = current_wp.next(2.0)
-            if not next_wps:
-                break
-            current_wp = next_wps[0]
-            points.append([current_wp.transform.location.x, 
-                          current_wp.transform.location.y])
-        
-        if len(points) < 3:
-            return 0.0
-        
-        # Fit circle to points and return curvature
-        x = np.array(points)[:,0]
-        y = np.array(points)[:,1]
-        curvature = np.polyfit(x, y, 2)[0]  # Quadratic fit
-        return abs(curvature)
 
     def _process_image(self, weak_self, image):
         self = weak_self()
@@ -1624,11 +1442,12 @@ class CarEnv:
             settings.synchronous_mode = True
             settings.fixed_delta_seconds = 0.05  # 20 FPS
             self.world.apply_settings(settings)
-            
+            self.map = self.world.get_map()
             # Wait for the world to stabilize
-            for _ in range(10):
+            for _ in range(50):
                 self.world.tick()
             
+
             print("CARLA world setup completed successfully")
             
         except Exception as e:
@@ -1766,42 +1585,90 @@ class CarEnv:
         }
     
     def get_state(self):
-        """Get complete state information"""
-        if self.front_camera is None:
-            return None
+        """Get the current state of the vehicle"""
+        try:
+            # Get vehicle state
+            transform = self.vehicle.get_transform()
+            velocity = self.vehicle.get_velocity()
+            angular_velocity = self.vehicle.get_angular_velocity()
 
-        # Initialize state array
-        state_array = []
+            # Calculate velocity magnitude
+            v = np.sqrt(velocity.x**2 + velocity.y**2)
 
-        # 1. Process YOLO detections (max_objects * 3 features)
-        detections = self.process_yolo_detection(self.front_camera)
-        for obj in detections:
-            state_array.extend([
-                obj['position'][0] / IM_WIDTH,     # x position normalized
-                obj['position'][1] / IM_HEIGHT,    # y position normalized
-                obj['depth'] / 100.0               # depth normalized
+            # Get yaw angle (phi)
+            phi = np.radians(transform.rotation.yaw)
+
+            # Estimate slip angle (beta)
+            # Simple estimation based on velocity direction
+            beta = np.arctan2(velocity.y, velocity.x) - phi if v > 0.1 else 0.0
+
+            # Return the 5 states needed by MPC
+            return np.array([
+                transform.location.x,  # x position
+                transform.location.y,  # y position
+                v,                    # velocity magnitude
+                phi,                  # heading angle
+                beta                  # slip angle
             ])
 
-        # Pad if fewer than max objects
-        remaining_objects = self.max_objects - len(detections)
-        state_array.extend([0.0] * (remaining_objects * 3))
-
-        # 2. Get waypoint information
-        waypoint_info = self.get_waypoint_info()
-        state_array.extend([
-            waypoint_info['distance'] / 50.0,      # distance normalized
-            waypoint_info['angle'] / math.pi       # angle normalized
-        ])
-
-        # 3. Get vehicle state
-        vehicle_state = self.get_vehicle_state()
-        state_array.extend([
-            vehicle_state['speed'] / 50.0,         # speed normalized
-            vehicle_state['steering']              # steering already normalized
-        ])
-
-        return np.array(state_array, dtype=np.float64)
+        except Exception as e:
+            print(f"Error in get_state: {e}")
+            traceback.print_exc()
+            return np.zeros(5)  # Return safe default state
     
+    def get_detected_objects(self):
+        """Get detected objects in the environment"""
+        detected_objects = []
+        
+        try:
+            # Get all actors in the world
+            actor_list = self.world.get_actors()
+            vehicle_list = actor_list.filter('vehicle.*')
+            
+            # Get ego vehicle location
+            ego_location = self.vehicle.get_location()
+            
+            # Get ego vehicle waypoint
+            ego_waypoint = self.map.get_waypoint(ego_location)
+            
+            for vehicle in vehicle_list:
+                if vehicle.id != self.vehicle.id:  # Skip ego vehicle
+                    vehicle_location = vehicle.get_location()
+                    
+                    # Get waypoint for other vehicle
+                    try:
+                        vehicle_waypoint = self.map.get_waypoint(vehicle_location)
+                        
+                        # Check if vehicle is in same or adjacent lane
+                        if vehicle_waypoint.lane_id == ego_waypoint.lane_id:
+                            # Calculate relative position
+                            rel_x = vehicle_location.x - ego_location.x
+                            rel_y = vehicle_location.y - ego_location.y
+                            
+                            # Get velocity
+                            velocity = vehicle.get_velocity()
+                            vel = np.sqrt(velocity.x**2 + velocity.y**2)
+                            
+                            detected_objects.append(np.array([rel_x, rel_y, vel]))
+                    except:
+                        # If waypoint calculation fails, use distance-based detection
+                        distance = ego_location.distance(vehicle_location)
+                        if distance < 50.0:  # Only consider vehicles within 50 meters
+                            rel_x = vehicle_location.x - ego_location.x
+                            rel_y = vehicle_location.y - ego_location.y
+                            
+                            velocity = vehicle.get_velocity()
+                            vel = np.sqrt(velocity.x**2 + velocity.y**2)
+                            
+                            detected_objects.append(np.array([rel_x, rel_y, vel]))
+            
+            return detected_objects
+            
+        except Exception as e:
+            print(f"Error in get_detected_objects: {e}")
+            traceback.print_exc()
+            return []  # Return empty list if there's an error
+
     def calculate_reward(self):
         """Calculate reward for the current state"""
         try:
@@ -1876,11 +1743,7 @@ class CarEnv:
     
 
 
-    def step(self, action):
-        """
-        Execute one environment step with MPC control
-        Returns: next_state, reward, done, info
-        """
+    def step(self, action=None):
         try:
             # Initialize info dictionary
             info = {
@@ -1914,45 +1777,43 @@ class CarEnv:
                 return current_state, 0, True, info
 
             try:
-                detected_objects = self.process_yolo_detection(self.front_camera)
-            except Exception as e:
-                print(f"YOLO detection error: {e}")
-                detected_objects = []
-
-            try:
                 # Get reference trajectory from global path
                 next_wp, next_idx = self.get_next_waypoint(self.vehicle.get_location())
                 if next_wp:
                     self.current_path_index = next_idx
                 reference_trajectory = self.get_reference_from_global_path(current_state)
 
+                # Get detected objects
+                detected_objects = self.get_detected_objects()
+
                 # Get MPC control action
-                mpc_action = self.mpc.solve_with_obstacle_avoidance(current_state, reference_trajectory, detected_objects)
+                mpc_action = self.mpc.solve(current_state, reference_trajectory, detected_objects)
 
                 if mpc_action is not None:
                     self.mpc_fail_counter = 0
-                    action = mpc_action
+                    # Convert MPC action to CARLA controls
+                    steering = float(np.clip(mpc_action[0], -1.0, 1.0))
+                    throttle = float(np.clip(mpc_action[1], 0.0, 1.0))
+                    brake = float(np.clip(mpc_action[2], 0.0, 1.0))
                 else:
                     self.mpc_fail_counter += 1
                     info['mpc_fail'] = True
                     print(f"MPC failed (attempt {self.mpc_fail_counter})")
-                    action = np.array([0.0, 0.0])  # Safe fallback control
-
-                # Convert MPC action to CARLA controls
-                throttle = float(np.clip((action[1] + 1) / 2, 0.0, 1.0))
-                steer = float(np.clip(action[0], -1.0, 1.0))
-                brake = 0.0
+                    # Safe fallback control
+                    steering = 0.0
+                    throttle = 0.0
+                    brake = 0.3
 
                 # Apply smoothing
                 if hasattr(self, 'last_control'):
                     smooth_factor = 0.8
                     throttle = smooth_factor * self.last_control.throttle + (1 - smooth_factor) * throttle
-                    steer = smooth_factor * self.last_control.steer + (1 - smooth_factor) * steer
+                    steering = smooth_factor * self.last_control.steer + (1 - smooth_factor) * steering
 
                 # Create control command
                 control = carla.VehicleControl(
                     throttle=throttle,
-                    steer=steer,
+                    steer=steering,
                     brake=brake,
                     hand_brake=False,
                     reverse=False,
@@ -1965,7 +1826,7 @@ class CarEnv:
                 # Update info
                 info.update({
                     'throttle': throttle,
-                    'steer': steer,
+                    'steer': steering,
                     'brake': brake
                 })
 
@@ -2021,7 +1882,7 @@ class CarEnv:
             if current_speed < self.reward_params['min_speed']:
                 self.stuck_time += 0.1
                 info['stuck_time'] = self.stuck_time
-                if self.stuck_time > 5.0:  
+                if self.stuck_time > 10.0:  # Vehicle stuck for more than 5 seconds
                     print("Vehicle stuck!")
                     done = True
             else:
@@ -2029,7 +1890,7 @@ class CarEnv:
 
             # Check maximum episode duration
             current_time = datetime.now()
-            if (current_time - self.episode_start).total_seconds() > 300:  
+            if (current_time - self.episode_start).total_seconds() > 300:  # 5 minutes max
                 print("Maximum episode duration reached")
                 done = True
 
@@ -2040,43 +1901,6 @@ class CarEnv:
             traceback.print_exc()
             return None, 0, True, info
 
-    def visualize_current_progress(self, current_loc, target_wp):
-        """
-        Visualize the current progress along the path
-        """
-        try:
-            # Draw line from current position to target
-            self.world.debug.draw_line(
-                current_loc + carla.Location(z=0.5),
-                target_wp.transform.location + carla.Location(z=0.5),
-                thickness=0.1,
-                color=carla.Color(r=255, g=0, b=0),  # Red line to current target
-                life_time=0.1
-            )
-
-            # Draw target waypoint
-            self.world.debug.draw_point(
-                target_wp.transform.location + carla.Location(z=1.0),
-                size=0.1,
-                color=carla.Color(r=0, g=255, b=0),  # Green for target
-                life_time=0.1
-            )
-
-            # Draw future path segment
-            if self.global_path:
-                path_length = len(self.global_path)
-                for i in range(self.current_path_index, min(self.current_path_index + 10, path_length - 1)):
-                    self.world.debug.draw_line(
-                        self.global_path[i].transform.location + carla.Location(z=0.5),
-                        self.global_path[i + 1].transform.location + carla.Location(z=0.5),
-                        thickness=0.1,
-                        color=carla.Color(r=0, g=0, b=255),  # Blue line for future path
-                        life_time=0.1
-                    )
-
-        except Exception as e:
-            print(f"Error in visualize_current_progress: {e}")
-            traceback.print_exc()
 
     def spawn_npcs(self):
         """Spawn NPC vehicles near and in front of the training vehicle"""
