@@ -72,7 +72,7 @@ except ImportError:
 # Constants
 IM_WIDTH = 640
 IM_HEIGHT = 480
-EPISODES = 200
+EPISODES = 500
 SECONDS_PER_EPISODE = 150
 BATCH_SIZE = 32
 LEARNING_RATE = 3e-4
@@ -250,8 +250,8 @@ class MPCController:
         
         # Control bounds with minimum throttle
         self.bounds = {
-            'steer': [-0.8, 0.8],
-            'throttle': [0.2, 0.8],  # Minimum throttle of 0.2
+            'steer': [-1.0, 1.0],
+            'throttle': [0.1, 1.0],  
             'brake': [0.0, 1.0],
             'v_max': 12.0,
             'v_min': 0.0,  # Don't allow negative velocity
@@ -263,12 +263,12 @@ class MPCController:
         
         # Initialize control smoothing
         self.last_controls = None
-        self.control_smoothing = 0.3  # Reduced smoothing for more responsive control
+        self.control_smoothing = 0.2 
         
 
 
     def stage_cost(self, state, control, reference, detected_objects):
-        """Modified cost function for better tracking"""
+        """Modified cost function for better tracking and obstacle avoidance"""
         # Path following error
         path_error = state[:2] - reference[:2]
         path_cost = np.sum(path_error**2)
@@ -288,7 +288,20 @@ class MPCController:
         # Additional cost for low speeds
         speed_penalty = 10.0 * np.exp(-state[2])  # Penalize low speeds
         
-        return 100.0*path_cost + 50.0*vel_cost + 20.0*heading_cost + control_cost + speed_penalty
+        # Obstacle avoidance cost
+        obstacle_cost = 0.0
+        for obj in detected_objects:
+            # Convert relative to absolute coordinates
+            obj_x = state[0] + obj[0]
+            obj_y = state[1] + obj[1]
+            
+            # Calculate distance to object
+            dist = np.sqrt((state[0]-obj_x)**2 + (state[1]-obj_y)**2)
+            
+            # Sigmoid cost that increases sharply within 5m
+            obstacle_cost += 100.0 / (1 + np.exp(0.5*(dist - 5.0)))
+        
+        return 100.0*path_cost + 50.0*vel_cost + 20.0*heading_cost + control_cost + speed_penalty + obstacle_cost
 
     def vehicle_dynamics(self, state, controls):
         """Continuous time vehicle dynamics"""
@@ -392,7 +405,7 @@ class MPCController:
         return k, K
     
     def solve(self, current_state, reference_trajectory, detected_objects):
-        """Solve MPC problem using iLQR"""
+        """Solve MPC problem using iLQR with enhanced safety features"""
         try:
             # Extract relevant state variables [x, y, v, phi, beta]
             if len(current_state) > 5:
@@ -401,14 +414,34 @@ class MPCController:
                 v = current_state[2]
                 phi = current_state[3]
                 beta = current_state[4] if len(current_state) > 4 else 0.0
-                
+
                 reduced_state = np.array([x, y, v, phi, beta])
             else:
                 reduced_state = current_state
 
             # Print current state for debugging
             print(f"Current state: v={reduced_state[2]:.2f} m/s, phi={np.degrees(reduced_state[3]):.2f}°")
-            
+
+            # Enhanced safety check with Time-To-Collision (TTC)
+            emergency_brake = False
+            for obj in detected_objects:
+                rel_x, rel_y = obj[0] - reduced_state[0], obj[1] - reduced_state[1]
+                vel = obj[2] if len(obj) > 2 else 0.0  # Object velocity if available
+
+                # Calculate distance and time-to-collision
+                distance = np.sqrt(rel_x**2 + rel_y**2)
+                closing_speed = reduced_state[2] - vel
+                ttc = distance / (closing_speed + 1e-5)  # Avoid division by zero
+
+                # Check both distance and TTC thresholds
+                if distance < self.safety_distance or (ttc > 0 and ttc < 2.0):
+                    print(f"Emergency brake! TTC: {ttc:.1f}s, Distance: {distance:.1f}m")
+                    emergency_brake = True
+                    break
+                
+            if emergency_brake:
+                return np.array([0.0, 0.0, 1.0])
+
             # Get heading to next reference point
             if len(reference_trajectory) > 0:
                 target = reference_trajectory[0]
@@ -418,70 +451,61 @@ class MPCController:
                 heading_error = target_heading - reduced_state[3]
                 heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
                 print(f"Target heading: {np.degrees(target_heading):.2f}°, Error: {np.degrees(heading_error):.2f}°")
-            
+
             # Force initial movement
             if reduced_state[2] < 0.5:  # If speed is less than 0.5 m/s
                 print("Forcing initial forward motion")
                 return np.array([0.0, 0.4, 0.0])  # Apply significant throttle
-            
+
             # Initialize trajectories
             x_traj = np.zeros((self.N + 1, self.nx))
             u_traj = np.zeros((self.N, self.nu))
             x_traj[0] = reduced_state
-            
-            # Safety checks for obstacles
-            min_obj_distance = float('inf')
-            for obj in detected_objects:
-                dist = np.sqrt(np.sum((reduced_state[:2] - obj[:2])**2))
-                min_obj_distance = min(dist, min_obj_distance)
-            
-            if min_obj_distance < self.safety_distance:
-                print("Emergency brake - Object too close!")
-                return np.array([0.0, 0.0, 1.0])
-            
+
             # Perform iLQR iterations
             for _ in range(5):
                 k, K = self.backward_pass(x_traj, u_traj, reference_trajectory, detected_objects)
                 x_traj_new, u_traj_new = self.forward_pass(reduced_state, u_traj, k, K)
                 x_traj = x_traj_new
                 u_traj = u_traj_new
-            
+
             # Get raw control action
             raw_control = u_traj[0]
-            
+
             # Apply bounds
             control = np.array([
                 np.clip(raw_control[0], self.bounds['steer'][0], self.bounds['steer'][1]),
                 np.clip(raw_control[1], self.bounds['throttle'][0], self.bounds['throttle'][1]),
                 np.clip(raw_control[2], self.bounds['brake'][0], self.bounds['brake'][1])
             ])
-            
+
             # Ensure minimum forward motion
             if control[1] < self.bounds['throttle'][0]:
                 control[1] = self.bounds['throttle'][0]
-            
+
             # Don't brake while accelerating
             if control[1] > 0.1:
                 control[2] = 0.0
-            
-            # Apply control smoothing
+
+            # Apply dynamic control smoothing based on steering angle
             if self.last_controls is not None:
-                control = self.control_smoothing * self.last_controls + \
-                         (1 - self.control_smoothing) * control
-            
+                current_steer = np.abs(control[0])
+                # Reduce smoothing when steering more (dynamic smoothing)
+                smooth_factor = self.control_smoothing * (1.0 - current_steer)
+                control = smooth_factor * self.last_controls + (1 - smooth_factor) * control
+
             # Store controls for next iteration
             self.last_controls = control.copy()
-            
+
             # Print control values for debugging
             print(f"Controls: steer={control[0]:.2f}, throttle={control[1]:.2f}, brake={control[2]:.2f}")
-            
+
             return control
 
         except Exception as e:
             print(f"Error in MPC solve: {e}")
             traceback.print_exc()
             return np.array([0.0, 0.3, 0.0])  # Safe fallback with forward motion
-        
 
 class PPOAgent:
     def __init__(self, state_dim, action_dim):
@@ -726,21 +750,56 @@ class GlobalPathPlanner:
 
         print(f"Path found with {len(path)} waypoints")
 
-        # Visualization code
-        smoothed_path = []
+        # Create dense interpolated path
+        dense_path = []
         for i in range(len(path)-1):
-            start = path[i].transform.location
-            end = path[i+1].transform.location
-            num_points = int(start.distance(end) // 2.0)  # Add points every 2 meters
-            for t in np.linspace(0, 1, num_points + 2)[:-1]:
-                loc = start + t*(end - start)
-                smoothed_path.append(self.world.get_map().get_waypoint(loc))
+            wp1 = path[i]
+            wp2 = path[i+1]
+            distance = wp1.transform.location.distance(wp2.transform.location)
+            num_points = max(2, int(distance // 0.5))  # 0.5m spacing
+    
+            # Get Euler angles for both rotations
+            roll1, pitch1, yaw1 = wp1.transform.rotation.roll, wp1.transform.rotation.pitch, wp1.transform.rotation.yaw
+            roll2, pitch2, yaw2 = wp2.transform.rotation.roll, wp2.transform.rotation.pitch, wp2.transform.rotation.yaw
+    
+            # Ensure the angles are properly wrapped
+            yaw1 = np.degrees(np.arctan2(np.sin(np.radians(yaw1)), np.cos(np.radians(yaw1))))
+            yaw2 = np.degrees(np.arctan2(np.sin(np.radians(yaw2)), np.cos(np.radians(yaw2))))
+            
+            # Handle the case where angles cross the 180/-180 boundary
+            if abs(yaw2 - yaw1) > 180:
+                if yaw2 > yaw1:
+                    yaw1 += 360
+                else:
+                    yaw2 += 360
+    
+            for t in np.linspace(0, 1, num_points):
+                # Interpolate location
+                loc = wp1.transform.location + t*(wp2.transform.location - wp1.transform.location)
+                
+                # Interpolate rotation angles
+                roll = roll1 + t*(roll2 - roll1)
+                pitch = pitch1 + t*(pitch2 - pitch1)
+                yaw = yaw1 + t*(yaw2 - yaw1)
+                
+                # Wrap yaw angle back to [-180, 180]
+                yaw = yaw % 360
+                if yaw > 180:
+                    yaw -= 360
+                
+                # Create new rotation object
+                rotation = carla.Rotation(roll=roll, pitch=pitch, yaw=yaw)
+                
+                # Create new waypoint with interpolated transform
+                interpolated_wp = self.world.get_map().get_waypoint(loc)
+                interpolated_wp.transform.rotation = rotation
+                dense_path.append(interpolated_wp)
 
-        # Visualize the complete path with thicker, more visible lines
-        for i in range(len(path)-1):
+        # Visualization code
+        for i in range(len(dense_path)-1):
             # Draw thick blue line between consecutive waypoints
-            begin = path[i].transform.location
-            end = path[i+1].transform.location
+            begin = dense_path[i].transform.location
+            end = dense_path[i+1].transform.location
 
             # Draw line slightly above ground
             begin = begin + carla.Location(z=0.5)
@@ -766,7 +825,7 @@ class GlobalPathPlanner:
 
         # Draw final waypoint
         self.world.debug.draw_point(
-            path[-1].transform.location + carla.Location(z=0.5),
+            dense_path[-1].transform.location + carla.Location(z=0.5),
             size=0.1,
             color=carla.Color(b=255, g=255, r=255),
             life_time=0.0,
@@ -775,7 +834,7 @@ class GlobalPathPlanner:
 
         # Draw start and end points more prominently
         self.world.debug.draw_point(
-            path[0].transform.location + carla.Location(z=1.0),
+            dense_path[0].transform.location + carla.Location(z=1.0),
             size=0.2,
             color=carla.Color(r=0, g=255, b=0),  # Green for start
             life_time=0.0,
@@ -783,14 +842,14 @@ class GlobalPathPlanner:
         )
 
         self.world.debug.draw_point(
-            path[-1].transform.location + carla.Location(z=1.0),
+            dense_path[-1].transform.location + carla.Location(z=1.0),
             size=0.2,
             color=carla.Color(r=255, g=0, b=0),  # Red for end
             life_time=0.0,
             persistent_lines=True
         )
 
-        return path
+        return dense_path
 
     def _add_velocity_to_path(self, path):
         """Add velocity information to path waypoints based on curvature"""
@@ -1009,36 +1068,38 @@ class CarEnv:
         except Exception as e:
             pass
 
+    # In get_reference_from_global_path:
     def get_reference_from_global_path(self, current_state):
-        """Generate reference trajectory from current position"""
-        if not self.global_path:
-            return np.zeros((self.mpc.N, 5))
-
         reference = []
-        current_idx = self.current_path_index
-
+        closest_idx = self.current_path_index
+        
+        # Look 2 seconds ahead for the first target
+        lookahead = int(2.0 / self.mpc.dt)  # 2 seconds
+        start_idx = min(closest_idx + lookahead, len(self.global_path)-1)
+        
         for i in range(self.mpc.N):
-            idx = min(current_idx + i, len(self.global_path)-1)
+            idx = min(start_idx + i, len(self.global_path)-1)
             wp = self.global_path[idx]
-
-            # Calculate target heading from path
-            next_idx = min(idx + 1, len(self.global_path)-1)
-            next_wp = self.global_path[next_idx]
-            dx = next_wp.transform.location.x - wp.transform.location.x
-            dy = next_wp.transform.location.y - wp.transform.location.y
+            
+            # Calculate direction vector for accurate heading
+            if idx < len(self.global_path)-1:
+                next_wp = self.global_path[idx+1]
+                dx = next_wp.transform.location.x - wp.transform.location.x
+                dy = next_wp.transform.location.y - wp.transform.location.y
+            else:
+                dx = np.cos(wp.transform.rotation.yaw)
+                dy = np.sin(wp.transform.rotation.yaw)
+                
             target_heading = np.arctan2(dy, dx)
-
-            # Set target speed (adjust these values as needed)
-            target_speed = 5.0  # m/s (about 18 km/h)
-
+            
             reference.append([
                 wp.transform.location.x,
                 wp.transform.location.y,
-                target_speed,
+                wp.velocity,  # Use waypoint's velocity
                 target_heading,
-                0.0  # Target slip angle
+                0.0
             ])
-
+        
         return np.array(reference)
 
     def get_next_waypoint(self, current_location, lookahead_distance=10.0):  # Reduced lookahead
