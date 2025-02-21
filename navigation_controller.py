@@ -1,20 +1,24 @@
+
 import carla
 import math
 import numpy as np
 from queue import PriorityQueue
-from collections import defaultdict
+import time
+import random
+import pygame
+from tqdm import tqdm
 
 class NavigationController:
     def __init__(self):
         # Control parameters
         self.max_steer = 0.7
         self.target_speed = 30.0  # km/h
-        
-        # Controller gains
-        self.k_p_lateral = 0.9
-        self.k_p_heading = 0.5
-        self.k_p_speed = 0.5
-        
+
+        # Controller gains - increased for more responsive control
+        self.k_p_lateral = 1.5    # Increased from 0.9
+        self.k_p_heading = 1.0    # Increased from 0.5
+        self.k_p_speed = 1.0      # Increased from 0.5
+
         # Path tracking
         self.waypoints = []
         self.visited_waypoints = set()
@@ -28,6 +32,9 @@ class NavigationController:
         # Visualization
         self.debug_lifetime = 0.1
         self.path_visualization_done = False
+
+        # Obstacle detection
+        self.obstacles = []
 
     def _heuristic(self, waypoint, goal_waypoint):
         """A* heuristic: straight-line distance to goal"""
@@ -154,25 +161,61 @@ class NavigationController:
         """Calculate control commands to follow path"""
         try:
             if not self.waypoints:
+                print("No waypoints available!")
                 return carla.VehicleControl(throttle=0, steer=0, brake=1.0)
                 
+            # Get current vehicle state
             vehicle_transform = vehicle.get_transform()
+            vehicle_loc = vehicle_transform.location
             current_speed = self._get_speed(vehicle)
             
-            self._update_waypoint_progress(vehicle.get_location())
+            # Debug current state
+            print(f"Current location: x={vehicle_loc.x:.2f}, y={vehicle_loc.y:.2f}")
+            print(f"Current speed: {current_speed:.2f} km/h")
             
+            # Update current waypoint index based on distance
+            self._update_waypoint_progress(vehicle_loc)
+            
+            # Get target waypoint
             target_wp = self.waypoints[self.current_waypoint_index]
             
+            # Calculate steering
             steer = self._calculate_steering(vehicle_transform, target_wp.transform)
-            throttle, brake = self._speed_control(current_speed)
             
-            if world is not None:
-                self._visualize(world, vehicle)
-                
-            return carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
+            # Calculate throttle and brake with more aggressive values
+            target_speed = self.target_speed
+            error = target_speed - current_speed
+            
+            if error > 0:
+                throttle = min(abs(error) * self.k_p_speed * 2.0, 1.0)  # More aggressive throttle
+                brake = 0.0
+            else:
+                throttle = 0.0
+                brake = min(abs(error) * self.k_p_speed, 1.0)
+            
+            # Debug control outputs
+            print(f"Target speed: {target_speed:.2f} km/h")
+            print(f"Speed error: {error:.2f} km/h")
+            print(f"Control outputs - Throttle: {throttle:.2f}, Brake: {brake:.2f}, Steer: {steer:.2f}")
+            
+            # Ensure minimum throttle when starting from stop
+            if current_speed < 0.1 and not brake:
+                throttle = max(throttle, 0.3)  # Minimum throttle to overcome inertia
+            
+            control = carla.VehicleControl(
+                throttle=float(throttle),
+                steer=float(steer),
+                brake=float(brake),
+                hand_brake=False,
+                reverse=False,
+                manual_gear_shift=False,
+                gear=1
+            )
+            
+            return control
             
         except Exception as e:
-            print(f"Control calculation failed: {str(e)}")
+            print(f"Error in get_control: {str(e)}")
             return carla.VehicleControl(throttle=0, steer=0, brake=1.0)
 
     def _calculate_steering(self, vehicle_transform, waypoint_transform):
@@ -204,17 +247,49 @@ class NavigationController:
         return np.clip(steering, -self.max_steer, self.max_steer)
 
     def _speed_control(self, current_speed):
-        """Calculate throttle and brake commands"""
-        error = self.target_speed - current_speed
-        
+        """Calculate throttle and brake commands with improved collision avoidance"""
+        # Check for nearby obstacles
+        min_distance = float('inf')
+        if self.obstacles:
+            # Convert current vehicle direction to a unit vector
+            forward_vector = np.array([1.0, 0.0, 0.0])  # Vehicle's local forward direction
+
+            for obstacle in self.obstacles:
+                # Only consider obstacles in front of the vehicle (x > 0)
+                if obstacle.x > 0:
+                    # Calculate distance to obstacle
+                    distance = math.sqrt(obstacle.x**2 + obstacle.y**2)
+
+                    # Check if obstacle is roughly in our lane (within 2 meters laterally)
+                    if abs(obstacle.y) < 2.0 and distance < min_distance:
+                        min_distance = distance
+
+        # Adjust target speed based on obstacles
+        safe_distance = 10.0  # meters
+        critical_distance = 7.0  # meters
+
+        if min_distance < critical_distance:
+            # Emergency brake
+            return 0.0, 1.0
+        elif min_distance < safe_distance:
+            # Gradually reduce speed based on distance
+            speed_factor = (min_distance - critical_distance) / (safe_distance - critical_distance)
+            target_speed = self.target_speed * speed_factor
+        else:
+            target_speed = self.target_speed
+
+        # Calculate control outputs
+        error = target_speed - current_speed
+
         if error > 0:
             throttle = min(abs(error) * self.k_p_speed, 1.0)
             brake = 0.0
         else:
             throttle = 0.0
             brake = min(abs(error) * self.k_p_speed, 1.0)
-            
+
         return throttle, brake
+    
 
     def _get_speed(self, vehicle):
         """Get current speed in km/h"""
@@ -298,8 +373,6 @@ class NavigationController:
                 life_time=self.debug_lifetime
             )
 
-
-
     def _visualize_exploration(self, explored_paths):
         """Visualize all explored paths"""
         for start_wp, end_wp in explored_paths:
@@ -372,38 +445,6 @@ class NavigationController:
             color=carla.Color(0, 255, 0),
             life_time=0.0
         )
-    def get_control(self, vehicle, world=None):
-        """Calculate control commands to follow path"""
-        try:
-            if not self.waypoints:
-                return carla.VehicleControl(throttle=0, steer=0, brake=1.0)
-                
-            # Get current vehicle state
-            vehicle_transform = vehicle.get_transform()
-            vehicle_loc = vehicle_transform.location
-            current_speed = self._get_speed(vehicle)
-            
-            # Update current waypoint index based on distance
-            self._update_waypoint_progress(vehicle_loc)
-            
-            # Get target waypoint
-            target_wp = self.waypoints[self.current_waypoint_index]
-            
-            # Calculate steering
-            steer = self._calculate_steering(vehicle_transform, target_wp.transform)
-            
-            # Calculate throttle and brake
-            throttle, brake = self._speed_control(current_speed)
-            
-            # Visualize if debugging
-            if world is not None:
-                self._visualize(world, vehicle)
-                
-            return carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
-            
-        except Exception as e:
-            print(f"Control calculation failed: {str(e)}")
-            return carla.VehicleControl(throttle=0, steer=0, brake=1.0)
 
     def _calculate_total_distance(self, path):
         """Calculate total path distance"""
@@ -413,3 +454,7 @@ class NavigationController:
                 path[i + 1].transform.location
             )
         return total_distance
+
+    def update_obstacles(self, obstacles):
+        """Update list of detected obstacles"""
+        self.obstacles = obstacles
