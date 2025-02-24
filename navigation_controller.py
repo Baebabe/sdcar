@@ -1,12 +1,8 @@
-
 import carla
 import math
 import numpy as np
 from queue import PriorityQueue
 import time
-import random
-import pygame
-from tqdm import tqdm
 
 class NavigationController:
     def __init__(self):
@@ -14,27 +10,35 @@ class NavigationController:
         self.max_steer = 0.7
         self.target_speed = 30.0  # km/h
 
-        # Controller gains - increased for more responsive control
-        self.k_p_lateral = 1.5    # Increased from 0.9
-        self.k_p_heading = 1.0    # Increased from 0.5
-        self.k_p_speed = 1.0      # Increased from 0.5
+        # Adjusted controller gains for smoother control
+        self.k_p_lateral = 0.9    # Reduced from 1.5
+        self.k_p_heading = 0.8    # Reduced from 1.0
+        self.k_p_speed = 1.0      
 
         # Path tracking
         self.waypoints = []
         self.visited_waypoints = set()
         self.current_waypoint_index = 0
         self.waypoint_distance_threshold = 2.0
-        
+
         # A* parameters
         self.waypoint_distance = 2.0
         self.max_search_dist = 200.0
+
+        # Store reference to vehicle for speed calculations
+        self._parent = None
+        self.last_control = None
         
         # Visualization
         self.debug_lifetime = 0.1
         self.path_visualization_done = False
-
+        
         # Obstacle detection
         self.obstacles = []
+        
+        # World reference for visualization
+        self.world = None
+        self.map = None
 
     def _heuristic(self, waypoint, goal_waypoint):
         """A* heuristic: straight-line distance to goal"""
@@ -158,20 +162,21 @@ class NavigationController:
         return None, float('inf')
 
     def get_control(self, vehicle, world=None):
-        """Calculate control commands to follow path"""
+        """Calculate control commands to follow path - simplified for strict path following"""
         try:
             if not self.waypoints:
                 print("No waypoints available!")
                 return carla.VehicleControl(throttle=0, steer=0, brake=1.0)
-                
+            
+            self._parent = vehicle
             # Get current vehicle state
             vehicle_transform = vehicle.get_transform()
             vehicle_loc = vehicle_transform.location
             current_speed = self._get_speed(vehicle)
             
-            # Debug current state
-            print(f"Current location: x={vehicle_loc.x:.2f}, y={vehicle_loc.y:.2f}")
-            print(f"Current speed: {current_speed:.2f} km/h")
+            # Update the world reference if provided
+            if world is not None and self.world is None:
+                self.world = world
             
             # Update current waypoint index based on distance
             self._update_waypoint_progress(vehicle_loc)
@@ -179,28 +184,51 @@ class NavigationController:
             # Get target waypoint
             target_wp = self.waypoints[self.current_waypoint_index]
             
+            # Calculate distance to current waypoint
+            distance_to_waypoint = vehicle_loc.distance(target_wp.transform.location)
+            
             # Calculate steering
             steer = self._calculate_steering(vehicle_transform, target_wp.transform)
             
-            # Calculate throttle and brake with more aggressive values
+            # Speed control based on distance to waypoint
             target_speed = self.target_speed
+            if distance_to_waypoint > 5.0:  # If far from waypoint
+                target_speed *= 0.7  # Reduce speed to 70%
+            
             error = target_speed - current_speed
             
+            # Calculate throttle and brake
             if error > 0:
-                throttle = min(abs(error) * self.k_p_speed * 2.0, 1.0)  # More aggressive throttle
+                throttle = min(abs(error) * self.k_p_speed, 0.75)
                 brake = 0.0
             else:
                 throttle = 0.0
-                brake = min(abs(error) * self.k_p_speed, 1.0)
-            
-            # Debug control outputs
-            print(f"Target speed: {target_speed:.2f} km/h")
-            print(f"Speed error: {error:.2f} km/h")
-            print(f"Control outputs - Throttle: {throttle:.2f}, Brake: {brake:.2f}, Steer: {steer:.2f}")
+                brake = min(abs(error) * self.k_p_speed, 0.75)
             
             # Ensure minimum throttle when starting from stop
             if current_speed < 0.1 and not brake:
                 throttle = max(throttle, 0.3)  # Minimum throttle to overcome inertia
+            
+            # Gradual steering changes for stability
+            if self.last_control:
+                max_steer_change = 0.1
+                steer = np.clip(
+                    steer,
+                    self.last_control.steer - max_steer_change,
+                    self.last_control.steer + max_steer_change
+                )
+            
+            # Debug output
+            print(f"\nPath following status:")
+            print(f"Current waypoint index: {self.current_waypoint_index}/{len(self.waypoints)-1}")
+            print(f"Distance to waypoint: {distance_to_waypoint:.2f}m")
+            print(f"Current speed: {current_speed:.2f}km/h")
+            print(f"Target speed: {target_speed:.2f}km/h")
+            print(f"Controls - Throttle: {throttle:.2f}, Brake: {brake:.2f}, Steer: {steer:.2f}")
+            
+            # Visualize the path if world is available
+            if self.world is not None:
+                self._visualize(self.world, vehicle)
             
             control = carla.VehicleControl(
                 throttle=float(throttle),
@@ -212,105 +240,268 @@ class NavigationController:
                 gear=1
             )
             
+            self.last_control = control
             return control
             
         except Exception as e:
             print(f"Error in get_control: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return carla.VehicleControl(throttle=0, steer=0, brake=1.0)
 
     def _calculate_steering(self, vehicle_transform, waypoint_transform):
-        """Calculate steering angle based on lateral and heading error"""
-        # Get relative location
-        wp_loc = waypoint_transform.location
-        veh_loc = vehicle_transform.location
-        
-        # Transform to vehicle's coordinate system
-        dx = wp_loc.x - veh_loc.x
-        dy = wp_loc.y - veh_loc.y
-        
-        # Calculate errors
-        vehicle_yaw = math.radians(vehicle_transform.rotation.yaw)
-        cos_yaw = math.cos(vehicle_yaw)
-        sin_yaw = math.sin(vehicle_yaw)
-        
-        lateral_error = -dx * sin_yaw + dy * cos_yaw
-        
-        # Heading error
-        waypoint_yaw = math.radians(waypoint_transform.rotation.yaw)
-        heading_error = math.atan2(math.sin(waypoint_yaw - vehicle_yaw), 
-                                 math.cos(waypoint_yaw - vehicle_yaw))
-        
-        # Combine errors
-        steering = (self.k_p_lateral * lateral_error + 
-                   self.k_p_heading * heading_error)
-        
-        return np.clip(steering, -self.max_steer, self.max_steer)
+        """Calculate steering angle with strict path following"""
+        try:
+            # Current vehicle state
+            veh_loc = vehicle_transform.location
+            vehicle_yaw = math.radians(vehicle_transform.rotation.yaw)
+            current_speed = self._get_speed(self._parent)
 
-    def _speed_control(self, current_speed):
-        """Calculate throttle and brake commands with improved collision avoidance"""
-        # Check for nearby obstacles
-        min_distance = float('inf')
-        if self.obstacles:
-            # Convert current vehicle direction to a unit vector
-            forward_vector = np.array([1.0, 0.0, 0.0])  # Vehicle's local forward direction
+            # Shorter lookahead for stricter path following
+            base_lookahead = max(2.0, min(current_speed * 0.2, 5.0))  # Reduced lookahead
 
-            for obstacle in self.obstacles:
-                # Only consider obstacles in front of the vehicle (x > 0)
-                if obstacle.x > 0:
-                    # Calculate distance to obstacle
-                    distance = math.sqrt(obstacle.x**2 + obstacle.y**2)
+            # Calculate path curvature but with less influence
+            curvature = self._estimate_path_curvature()
 
-                    # Check if obstacle is roughly in our lane (within 2 meters laterally)
-                    if abs(obstacle.y) < 2.0 and distance < min_distance:
-                        min_distance = distance
+            # Minimal reduction of lookahead in turns
+            lookahead_distance = base_lookahead * (1.0 - 0.1 * abs(curvature))  # Reduced influence of curvature
 
-        # Adjust target speed based on obstacles
-        safe_distance = 10.0  # meters
-        critical_distance = 7.0  # meters
+            # Use fewer preview points closer to vehicle
+            preview_points = self._get_preview_points(lookahead_distance)
 
-        if min_distance < critical_distance:
-            # Emergency brake
-            return 0.0, 1.0
-        elif min_distance < safe_distance:
-            # Gradually reduce speed based on distance
-            speed_factor = (min_distance - critical_distance) / (safe_distance - critical_distance)
-            target_speed = self.target_speed * speed_factor
-        else:
-            target_speed = self.target_speed
+            # Calculate weighted steering based on preview points
+            total_steering = 0
+            total_weight = 0
 
-        # Calculate control outputs
-        error = target_speed - current_speed
+            for i, target_loc in enumerate(preview_points):
+                # Higher weight on closest point
+                weight = 1.0 / (i + 1.1)  # More emphasis on immediate path
 
-        if error > 0:
-            throttle = min(abs(error) * self.k_p_speed, 1.0)
-            brake = 0.0
-        else:
-            throttle = 0.0
-            brake = min(abs(error) * self.k_p_speed, 1.0)
+                # Convert target to vehicle's coordinate system
+                dx = target_loc.x - veh_loc.x
+                dy = target_loc.y - veh_loc.y
 
-        return throttle, brake
+                # Transform target into vehicle's coordinate system
+                cos_yaw = math.cos(vehicle_yaw)
+                sin_yaw = math.sin(vehicle_yaw)
+
+                target_x = dx * cos_yaw + dy * sin_yaw
+                target_y = -dx * sin_yaw + dy * cos_yaw
+
+                # Calculate angle and immediate path curvature
+                angle = math.atan2(target_y, target_x)
+                if abs(target_x) > 0.01:
+                    point_curvature = 2.0 * target_y / (target_x * target_x + target_y * target_y)
+                else:
+                    point_curvature = 0.0
+
+                # Adjust steering components to focus on immediate path following
+                point_steering = (
+                    0.4 * point_curvature +  # Reduced influence of curvature
+                    0.6 * self.k_p_lateral * (target_y / lookahead_distance) +  # Increased cross-track correction
+                    0.3 * self.k_p_heading * angle  # Moderate heading correction
+                )
+
+                total_steering += point_steering * weight
+                total_weight += weight
+
+            # Calculate final steering
+            if total_weight > 0:
+                steering = total_steering / total_weight
+            else:
+                steering = 0.0
+
+            # More conservative speed-based steering adjustments
+            speed_factor = min(current_speed / 30.0, 1.0)
+            max_steer_change = 0.12 * (1.0 - 0.4 * speed_factor)  # More conservative rate limiting
+
+            # Apply steering limits
+            if self.last_control:
+                steering = np.clip(
+                    steering,
+                    self.last_control.steer - max_steer_change,
+                    self.last_control.steer + max_steer_change
+                )
+
+            # Reduced additional steering in turns
+            max_steer = self.max_steer * (1.0 + 0.1 * abs(curvature))  # Minimal increase in turns
+            steering = np.clip(steering, -max_steer, max_steer)
+
+            return steering
+
+        except Exception as e:
+            print(f"Error in steering calculation: {str(e)}")
+            return 0.0
+
+    def _estimate_path_curvature(self):
+        """Estimate the curvature of the upcoming path section"""
+        try:
+            if self.current_waypoint_index >= len(self.waypoints) - 2:
+                return 0.0
+
+            # Get three consecutive waypoints
+            p1 = self.waypoints[self.current_waypoint_index].transform.location
+            p2 = self.waypoints[self.current_waypoint_index + 1].transform.location
+            p3 = self.waypoints[self.current_waypoint_index + 2].transform.location
+
+            # Calculate vectors
+            v1 = np.array([p2.x - p1.x, p2.y - p1.y])
+            v2 = np.array([p3.x - p2.x, p3.y - p2.y])
+
+            # Calculate angle between vectors
+            dot_product = np.dot(v1, v2)
+            norms = np.linalg.norm(v1) * np.linalg.norm(v2)
+
+            if norms < 1e-6:
+                return 0.0
+
+            cos_angle = np.clip(dot_product / norms, -1.0, 1.0)
+            angle = np.arccos(cos_angle)
+
+            # Normalize curvature to [-1, 1] range
+            curvature = angle / np.pi
+
+            return curvature
+
+        except Exception as e:
+            print(f"Error calculating curvature: {str(e)}")
+            return 0.0
+
+    def _get_preview_points(self, base_lookahead):
+        """Get preview points with closer spacing for stricter path following"""
+        preview_points = []
+        current_idx = self.current_waypoint_index
+
+        # Get points with closer spacing
+        distances = [base_lookahead * mult for mult in [0.8, 1.0, 1.2]]  # Closer spacing of preview points
+
+        for dist in distances:
+            # Find waypoint at approximately this distance
+            accumulated_dist = 0
+            idx = current_idx
+
+            while idx < len(self.waypoints) - 1:
+                wp1 = self.waypoints[idx].transform.location
+                wp2 = self.waypoints[idx + 1].transform.location
+                segment_dist = wp1.distance(wp2)
+
+                if accumulated_dist + segment_dist >= dist:
+                    # Interpolate point at exact distance
+                    remaining = dist - accumulated_dist
+                    fraction = remaining / segment_dist
+                    x = wp1.x + fraction * (wp2.x - wp1.x)
+                    y = wp1.y + fraction * (wp2.y - wp1.y)
+                    z = wp1.z + fraction * (wp2.z - wp1.z)
+                    preview_points.append(carla.Location(x, y, z))
+                    break
+                
+                accumulated_dist += segment_dist
+                idx += 1
+
+            if idx >= len(self.waypoints) - 1:
+                preview_points.append(self.waypoints[-1].transform.location)
+
+        return preview_points
+
+    def _update_waypoint_progress(self, vehicle_location):
+        """Update progress along waypoints with improved safety stop handling"""
+        if self.current_waypoint_index >= len(self.waypoints):
+            return
+
+        current_wp = self.waypoints[self.current_waypoint_index]
+        distance = vehicle_location.distance(current_wp.transform.location)
+
+        # Only update waypoint if we're close enough AND moving forward
+        if distance < self.waypoint_distance_threshold:
+            # Check if we're actually moving towards the next waypoint
+            if self.last_control and self.last_control.throttle > 0:
+                self.visited_waypoints.add(self.current_waypoint_index)
+                self.current_waypoint_index = min(self.current_waypoint_index + 1, 
+                                                len(self.waypoints) - 1)
+
+
+    def _reset_control_state(self):
+        """Reset control state after aggressive braking"""
+        self.last_control = None
+        # Reset any accumulated steering
+        return carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.0)
+
+    def force_path_recovery(self, vehicle):
+        """Force vehicle back to path after deviation"""
+        if not self.waypoints:
+            return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
+
+        try:
+            # Get current vehicle state
+            vehicle_transform = vehicle.get_transform()
+            vehicle_loc = vehicle_transform.location
+
+            # Find closest waypoint on path
+            min_dist = float('inf')
+            closest_idx = self.current_waypoint_index
+
+            # Look at all remaining waypoints
+            for i in range(self.current_waypoint_index, len(self.waypoints)):
+                wp_loc = self.waypoints[i].transform.location
+                dist = vehicle_loc.distance(wp_loc)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_idx = i
+
+            # Update waypoint index if we found a closer one
+            if closest_idx != self.current_waypoint_index:
+                print(f"Path recovery - updating waypoint index from {self.current_waypoint_index} to {closest_idx}")
+                self.current_waypoint_index = closest_idx
+
+            # Get target waypoint
+            target_wp = self.waypoints[self.current_waypoint_index]
+
+            # Calculate strong corrective steering
+            steer = self._calculate_steering(vehicle_transform, target_wp.transform)
+
+            # Apply stronger steering correction for recovery
+            steer *= 1.2  # Increase steering response
+
+            # Get current speed
+            current_speed = self._get_speed(vehicle)
+
+            # Determine throttle and brake
+            if current_speed < 5.0:  # Very slow or stopped
+                throttle = 0.3  # Gentle acceleration
+                brake = 0.0
+            else:
+                # Maintain moderate speed during recovery
+                target_speed = min(20.0, self.target_speed * 0.5)  # Reduced speed
+                speed_error = target_speed - current_speed
+
+                if speed_error > 0:
+                    throttle = min(0.5, speed_error * self.k_p_speed)
+                    brake = 0.0
+                else:
+                    throttle = 0.0
+                    brake = min(0.5, -speed_error * self.k_p_speed)
+
+            # Create recovery control
+            control = carla.VehicleControl(
+                throttle=float(throttle),
+                steer=float(steer),
+                brake=float(brake),
+                hand_brake=False
+            )
+
+            self.last_control = control
+            return control
+
+        except Exception as e:
+            print(f"Error in path recovery: {str(e)}")
+            return self._reset_control_state()
     
-
     def _get_speed(self, vehicle):
         """Get current speed in km/h"""
         vel = vehicle.get_velocity()
         return 3.6 * math.sqrt(vel.x**2 + vel.y**2)
-
-    # 3. Path Tracking Functions
-    def _update_waypoint_progress(self, vehicle_location):
-        """Update progress along waypoints"""
-        if self.current_waypoint_index >= len(self.waypoints):
-            return
-            
-        current_wp = self.waypoints[self.current_waypoint_index]
-        distance = vehicle_location.distance(current_wp.transform.location)
-        
-        if distance < self.waypoint_distance_threshold:
-            self.visited_waypoints.add(self.current_waypoint_index)
-            self.current_waypoint_index = min(self.current_waypoint_index + 1, 
-                                            len(self.waypoints) - 1)
-
-    # 4. Visualization Functions
+    
+    # New Visualization Functions
     def _visualize(self, world, vehicle):
         """Visualize real-time progress along the A* path"""
         if not self.waypoints:
@@ -319,7 +510,7 @@ class NavigationController:
         # First time visualization of complete path with A* results
         if not self.path_visualization_done:
             self._visualize_complete_path(world, self.waypoints, 
-                                       self._calculate_total_distance(self.waypoints))
+                                        self._calculate_total_distance(self.waypoints))
             self.path_visualization_done = True
             
         # Draw current progress on path
@@ -352,11 +543,11 @@ class NavigationController:
             )
             
         # Draw progress percentage and current metrics
-        progress = (len(self.visited_waypoints) / len(self.waypoints)) * 100
+        progress = (len(self.visited_waypoints) / len(self.waypoints)) * 100 if self.waypoints else 0
         current_loc = vehicle.get_location()
         distance_to_target = current_loc.distance(
             self.waypoints[self.current_waypoint_index].transform.location
-        )
+        ) if self.current_waypoint_index < len(self.waypoints) else 0
         
         # Draw progress information
         info_text = [
@@ -375,12 +566,15 @@ class NavigationController:
 
     def _visualize_exploration(self, explored_paths):
         """Visualize all explored paths"""
+        if self.world is None:
+            return
+            
         for start_wp, end_wp in explored_paths:
             self.world.debug.draw_line(
                 start_wp.transform.location + carla.Location(z=0.5),
                 end_wp.transform.location + carla.Location(z=0.5),
                 thickness=0.1,
-                color=carla.Color(64, 64, 255),  # Light blue
+                color=carla.Color(173, 216, 230),  # Light blue
                 life_time=0.0
             )
 
