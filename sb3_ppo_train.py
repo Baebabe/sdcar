@@ -1,0 +1,529 @@
+import os
+import time
+import numpy as np
+import gymnasium as gym 
+from gymnasium import spaces 
+import torch
+import optuna #used for hyperparameter optimization
+from typing import Callable, Dict, List, Optional, Tuple, Type, Union
+import json
+
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback, EvalCallback
+from stable_baselines3.common.logger import configure
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.evaluation import evaluate_policy
+
+# Custom wrapper for your CarEnv to make it gym-compatible
+class CarlaGymEnv(gym.Env):
+    """Custom Environment that follows gym interface for CARLA environment"""
+    metadata = {'render.modes': ['human']}
+
+    def __init__(self, carla_env=None):
+        super(CarlaGymEnv, self).__init__()
+        
+        # Create or use provided CARLA environment
+        if carla_env is None:
+            from carla_env import CarEnv  # Import your CarEnv class
+            self.env = CarEnv()
+        else:
+            self.env = carla_env
+            
+        # Define action and observation space
+        # They must be gym.spaces objects
+        
+        # Action space: [steering, throttle/brake]
+        # Both ranging from -1 to 1
+        self.action_space = spaces.Box(
+            low=np.array([-1.0, -1.0]),
+            high=np.array([1.0, 1.0]),
+            dtype=np.float32
+        )
+        
+        # Observation space:
+        # - object detections: max_objects * 3 features (x, y, depth)
+        # - lane info: 2 features (distance, angle)
+        # - vehicle state: 2 features (speed, steering)
+        obs_dim = self.env.max_objects * 3 + 2 + 2
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(obs_dim,),
+            dtype=np.float32
+        )
+        
+        self.episode_reward = 0
+        self.episode_length = 0
+        self.metrics = {
+            'speeds': [],
+            'collisions': 0,
+            'lane_deviations': []
+        }
+
+    def step(self, action):
+        # Execute action and get results
+        obs, reward, done, info = self.env.step(action)
+        
+        # Update episode metrics
+        self.episode_reward += reward
+        self.episode_length += 1
+        if 'speed' in info:
+            self.metrics['speeds'].append(info['speed'])
+        if 'collision' in info:
+            self.metrics['collisions'] += 1
+        if 'distance_from_center' in info:
+            self.metrics['lane_deviations'].append(info['distance_from_center'])
+        
+        # Update info with episode metrics
+        info.update({
+            'episode': {
+                'r': self.episode_reward,
+                'l': self.episode_length
+            } if done else None
+        })
+        
+        # Convert to gym format
+        return obs.astype(np.float32), reward, done, False, info
+
+    def reset(self, **kwargs):
+        # Reset the environment
+        obs = self.env.reset()
+        
+        # Reset episode metrics
+        self.episode_reward = 0
+        self.episode_length = 0
+        self.metrics = {'speeds': [], 'collisions': 0, 'lane_deviations': []}
+        
+        # Convert to gym format
+        return obs.astype(np.float32), {}
+
+    def render(self, mode='human'):
+        # The environment already renders via pygame in _process_image
+        pass
+
+    def close(self):
+        if hasattr(self.env, 'cleanup_actors'):
+            self.env.cleanup_actors()
+        if hasattr(self.env, 'cleanup_npcs'):
+            self.env.cleanup_npcs()
+
+# Callback for training monitoring
+class TrainingMonitorCallback(BaseCallback):
+    """
+    Custom callback for plotting additional values in tensorboard.
+    """
+    def __init__(self, verbose=0):
+        super(TrainingMonitorCallback, self).__init__(verbose)
+        self.training_metrics = {
+            'episode_rewards': [],
+            'episode_lengths': [],
+            'avg_speeds': [],
+            'collisions': [],
+            'lane_deviations': []
+        }
+        self.start_time = time.time()
+
+    def _on_step(self):
+        # Log scalar metrics for tensorboard
+        for i in range(len(self.model.env.buf_dones)):
+            if self.model.env.buf_dones[i]:
+                # Extract metrics from the environment
+                env_idx = i if self.model.env.num_envs > 1 else 0
+                env = self.training_env.envs[env_idx].env
+                
+                if hasattr(env, 'metrics'):
+                    # Calculate episode metrics
+                    avg_speed = np.mean(env.metrics['speeds']) if env.metrics['speeds'] else 0
+                    max_lane_dev = max(env.metrics['lane_deviations']) if env.metrics['lane_deviations'] else 0
+                    
+                    # Store metrics
+                    self.training_metrics['episode_rewards'].append(env.episode_reward)
+                    self.training_metrics['episode_lengths'].append(env.episode_length)
+                    self.training_metrics['avg_speeds'].append(avg_speed)
+                    self.training_metrics['collisions'].append(env.metrics['collisions'])
+                    self.training_metrics['lane_deviations'].append(max_lane_dev)
+                    
+                    # Log to tensorboard
+                    self.logger.record('env/episode_reward', env.episode_reward)
+                    self.logger.record('env/episode_length', env.episode_length)
+                    self.logger.record('env/average_speed', avg_speed)
+                    self.logger.record('env/collisions', env.metrics['collisions'])
+                    self.logger.record('env/max_lane_deviation', max_lane_dev)
+                    
+                    # Log training speed
+                    elapsed_time = time.time() - self.start_time
+                    fps = int(self.num_timesteps / elapsed_time)
+                    self.logger.record('time/fps', fps)
+        
+        return True
+    
+    def save_metrics(self, path):
+        """Save training metrics to a file"""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            json.dump(self.training_metrics, f)
+
+# Custom feature extractor (optional, for more complex inputs)
+class CustomFeatureExtractor(BaseFeaturesExtractor):
+    """
+    Custom feature extractor for more complex processing of observations
+    """
+    def __init__(self, observation_space, features_dim=128):
+        super(CustomFeatureExtractor, self).__init__(observation_space, features_dim)
+        
+        # Neural network layers
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(observation_space.shape[0], 256),
+            torch.nn.ReLU(),
+            torch.nn.Linear(256, features_dim),
+            torch.nn.ReLU()
+        )
+    
+    def forward(self, observations):
+        return self.net(observations)
+
+# Create a vectorized environment
+def make_env(env_id, rank, seed=0):
+    """
+    Utility function for multiprocessed env.
+    
+    :param env_id: (str) the environment ID
+    :param rank: (int) index of the subprocess
+    :param seed: (int) the initial seed for RNG
+    """
+    def _init():
+        env = CarlaGymEnv()
+        env.seed(seed + rank)
+        return env
+    set_random_seed(seed)
+    return _init
+
+# Function to perform hyperparameter optimization
+def optimize_ppo(trial):
+    """
+    Optimization function for Optuna
+    """
+    # Define the range of hyperparameters to search
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
+    n_steps = trial.suggest_int("n_steps", 256, 2048, log=True)
+    batch_size = trial.suggest_int("batch_size", 32, 256, log=True)
+    gamma = trial.suggest_float("gamma", 0.95, 0.999)
+    gae_lambda = trial.suggest_float("gae_lambda", 0.9, 0.999)
+    ent_coef = trial.suggest_float("ent_coef", 0.00001, 0.1, log=True)
+    clip_range = trial.suggest_float("clip_range", 0.1, 0.3)
+    
+    # Setup environment for evaluation
+    env = CarlaGymEnv()
+    env = Monitor(env)
+    
+    # Create the model with current hyperparameters
+    model = PPO("MlpPolicy", 
+                env, 
+                learning_rate=learning_rate,
+                n_steps=n_steps,
+                batch_size=batch_size,
+                gamma=gamma,
+                gae_lambda=gae_lambda,
+                ent_coef=ent_coef,
+                clip_range=clip_range,
+                verbose=0)
+    
+    # Train model for a small number of steps
+    try:
+        model.learn(total_timesteps=10000)
+        
+        # Evaluate model 
+        mean_reward, _ = evaluate_policy(model, env, n_eval_episodes=3)
+        env.close()
+        
+        return mean_reward
+    
+    except Exception as e:
+        print(f"Optimization trial failed: {e}")
+        env.close()
+        return -1000  # Return a poor score on failure
+        
+def train_ppo(num_envs=1, total_timesteps=1000000, hyperparameter_tuning=False, 
+              continue_training=False, checkpoint_path=None):
+    """
+    Train the PPO agent with all the advanced features
+    
+    Parameters:
+        num_envs: Number of parallel environments
+        total_timesteps: Total timesteps to train for
+        hyperparameter_tuning: Whether to run hyperparameter optimization
+        continue_training: Whether to continue from a previous checkpoint
+        checkpoint_path: Path to the previous model checkpoint
+    """
+    # Set paths
+    log_dir = "logs"
+    save_dir = "models"
+    tensorboard_dir = os.path.join(log_dir, f"ppo_carla_{int(time.time())}")
+    metrics_path = os.path.join(log_dir, "training_metrics.json")
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Create vectorized environments
+    if num_envs > 1:
+        print(f"Creating {num_envs} parallel environments...")
+        env = SubprocVecEnv([make_env("CarlaGymEnv", i) for i in range(num_envs)])
+    else:
+        print("Creating single environment...")
+        env = DummyVecEnv([lambda: CarlaGymEnv()])
+    
+    # Add normalization wrapper for observations and rewards
+    if continue_training and os.path.exists(f"{os.path.dirname(checkpoint_path)}/vec_normalize.pkl"):
+        print(f"Loading normalization statistics from {os.path.dirname(checkpoint_path)}/vec_normalize.pkl")
+        env = VecNormalize.load(f"{os.path.dirname(checkpoint_path)}/vec_normalize.pkl", env)
+        # Don't update normalization statistics if not needed
+        # env.training = True  # Set to False if you don't want to update normalization statistics
+        env.norm_reward = True
+    else:
+        env = VecNormalize(
+            env,
+            norm_obs=True,
+            norm_reward=True,
+            clip_obs=10.0,
+            clip_reward=10.0,
+            gamma=0.99 if not hyperparameter_tuning else hp["gamma"]
+        )
+    
+    # Run hyperparameter optimization if enabled and not continuing training
+    if hyperparameter_tuning and not continue_training:
+        print("Running hyperparameter optimization...")
+        study = optuna.create_study(direction="maximize")
+        study.optimize(optimize_ppo, n_trials=20)
+        
+        print("Best hyperparameters:", study.best_params)
+        hp = study.best_params
+    else:
+        # Use default hyperparameters
+        hp = {
+            "learning_rate": 3e-4,
+            "n_steps": 1024,
+            "batch_size": 64,
+            "gamma": 0.99,
+            "gae_lambda": 0.95,
+            "ent_coef": 0.01,
+            "clip_range": 0.2
+        }
+    
+    # Configure logger
+    new_logger = configure(tensorboard_dir, ["tensorboard", "stdout"])
+    
+    # Set up callbacks
+    monitor_callback = TrainingMonitorCallback()
+    
+    checkpoint_callback = CheckpointCallback(
+        save_freq=10000,
+        save_path=save_dir,
+        name_prefix="ppo_carla_model",
+        save_vecnormalize=True
+    )
+    
+    # Separate environment for evaluation
+    eval_env = DummyVecEnv([lambda: CarlaGymEnv()])
+    eval_env = VecNormalize.load(f"{save_dir}/vec_normalize.pkl", eval_env) if os.path.exists(f"{save_dir}/vec_normalize.pkl") else VecNormalize(eval_env)
+    # Don't update the normalization statistics during evaluation
+    eval_env.training = False
+    eval_env.norm_reward = False
+    
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=f"{save_dir}/best_model",
+        log_path=log_dir,
+        eval_freq=20000,
+        n_eval_episodes=5,
+        deterministic=True
+    )
+    
+    callback_list = CallbackList([checkpoint_callback, monitor_callback, eval_callback])
+    
+
+    # Define policy kwargs
+    # Uncomment to use the custom feature extractor
+    # policy_kwargs = {
+    #     "features_extractor_class": CustomFeatureExtractor,
+    #     "features_extractor_kwargs": {"features_dim": 128}
+    # }
+    # Define policy kwargs
+    
+    policy_kwargs = {
+        "net_arch": [dict(pi=[128, 64], vf=[128, 64])]
+    }
+    
+    # Create or load the PPO model
+    if continue_training and checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"Loading model from {checkpoint_path} to continue training...")
+        model = PPO.load(
+            checkpoint_path,
+            env=env,
+            tensorboard_log=tensorboard_dir,
+            verbose=1
+        )
+        # Optionally reset the learning rate schedule
+        model.learning_rate = lr_schedule if 'lr_schedule' in locals() else hp["learning_rate"]
+    else:
+        # Create a custom learning rate schedule
+        def lr_schedule(remaining_progress):
+            """Linear learning rate schedule"""
+            return hp["learning_rate"] * remaining_progress
+        
+        # Create a new model
+        model = PPO(
+            "MlpPolicy",
+            env,
+            learning_rate=lr_schedule,
+            n_steps=hp["n_steps"],
+            batch_size=hp["batch_size"],
+            gamma=hp["gamma"],
+            gae_lambda=hp["gae_lambda"],
+            ent_coef=hp["ent_coef"],
+            clip_range=hp["clip_range"],
+            policy_kwargs=policy_kwargs,
+            tensorboard_log=tensorboard_dir,
+            verbose=1
+        )
+    
+    # Set logger
+    model.set_logger(new_logger)
+    
+    try:
+        print("Starting training...")
+        start_time = time.time()
+        
+        # Train the model
+        model.learn(
+            total_timesteps=total_timesteps,
+            callback=callback_list,
+            reset_num_timesteps=not continue_training  # Don't reset timestep count if continuing training
+        )
+        
+        # Save the final model
+        model.save(f"{save_dir}/final_model")
+        # Save VecNormalize statistics
+        env.save(f"{save_dir}/vec_normalize.pkl")
+        
+        # Save training metrics
+        monitor_callback.save_metrics(metrics_path)
+        
+        training_time = time.time() - start_time
+        print(f"Training completed in {training_time / 3600:.2f} hours")
+        
+    except KeyboardInterrupt:
+        print("Training interrupted by user")
+        # Save model on interrupt
+        model.save(f"{save_dir}/interrupted_model")
+        env.save(f"{save_dir}/vec_normalize_interrupted.pkl")
+        print(f"Model saved to {save_dir}/interrupted_model.zip")
+    except Exception as e:
+        print(f"Training error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Clean up
+        env.close()
+        eval_env.close()
+        
+    return model
+
+# Evaluate the trained model
+def evaluate_model(model_path, num_episodes=10):
+    """
+    Evaluate a trained PPO model
+    """
+    # Load the environment
+    env = CarlaGymEnv()
+    env = Monitor(env)
+    
+    # Load the model
+    model = PPO.load(model_path)
+    
+    try:
+        print(f"Evaluating model: {model_path}")
+        mean_reward, std_reward = evaluate_policy(
+            model, 
+            env, 
+            n_eval_episodes=num_episodes,
+            deterministic=True
+        )
+        
+        print(f"Mean reward: {mean_reward:.2f} +/- {std_reward:.2f}")
+        
+        # Get additional metrics
+        episode_lengths = []
+        speeds = []
+        collisions = 0
+        
+        for i in range(num_episodes):
+            obs, _ = env.reset()
+            done = False
+            episode_length = 0
+            
+            while not done:
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, done, _, info = env.step(action)
+                episode_length += 1
+                
+                if 'speed' in info:
+                    speeds.append(info['speed'])
+                if 'collision' in info:
+                    collisions += 1
+            
+            episode_lengths.append(episode_length)
+            print(f"Episode {i+1}: Length = {episode_length}")
+        
+        # Print summary statistics
+        print("\nEvaluation Summary:")
+        print(f"Average Episode Length: {np.mean(episode_lengths):.2f}")
+        print(f"Average Speed: {np.mean(speeds):.2f} km/h")
+        print(f"Total Collisions: {collisions}")
+        
+    except Exception as e:
+        print(f"Evaluation error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        env.close()
+
+if __name__ == "__main__":
+    # Set random seeds for reproducibility
+    set_random_seed(42)
+    
+    # Whether to tune hyperparameters first
+    TUNE_HYPERPARAMETERS = False
+    
+    # Whether to continue training from a checkpoint
+    CONTINUE_TRAINING = True
+    CHECKPOINT_PATH = "models/ppo_carla_model_990000_steps.zip"  # Specify your checkpoint path here
+    
+    try:
+        print("Starting CARLA PPO training with Stable Baselines3")
+        print(f"Device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
+        
+        # Train the model
+        model = train_ppo(
+            num_envs=1,  # Number of parallel environments
+            total_timesteps=1_000_000,  # Total timesteps to train for
+            hyperparameter_tuning=TUNE_HYPERPARAMETERS,  # Whether to run hyperparameter tuning
+            continue_training=CONTINUE_TRAINING,  # Whether to continue from a checkpoint
+            checkpoint_path=CHECKPOINT_PATH if CONTINUE_TRAINING else None  # Path to the checkpoint
+        )
+        
+        # Evaluate the best model
+        best_model_path = "models/best_model/best_model.zip"
+        if os.path.exists(best_model_path):
+            print("\nEvaluating best model...")
+            evaluate_model(best_model_path)
+        
+    except KeyboardInterrupt:
+        print("\nProgram terminated by user")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("Program terminated")
