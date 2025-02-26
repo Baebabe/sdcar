@@ -17,7 +17,7 @@ import requests
 import pygame
 from pygame import surfarray
 import traceback
-
+from mpc import MPCController
 def download_weights(url, save_path):
     """Download weights if they don't exist"""
     if not os.path.exists(save_path):
@@ -120,13 +120,15 @@ class CarEnv:
         self.last_location = None
         self.stuck_time = 0
         self.episode_start = 0
-        
+
+        # Add MPC controller
+        self.controller = None  # This will hold your MPC controller
+
         # Add missing attributes
         self.front_camera = None
         self.npc_vehicles = []
         self.pedestrians = []
         self.pedestrian_controllers = []
-        
 
         pygame.init()
         self.display = None
@@ -138,10 +140,10 @@ class CarEnv:
             carla.Location(x=1.6, z=1.7),
             carla.Rotation(pitch=0)
         )
-        
+
         # Initialize CARLA world first
         self.setup_world()
-        
+
         # Initialize YOLO model
         self._init_yolo()
 
@@ -244,7 +246,7 @@ class CarEnv:
         return state
 
     def setup_vehicle(self):
-        """Spawn and setup the ego vehicle"""
+        """Spawn and setup the ego vehicle with MPC controller"""
         try:
             print("Starting vehicle setup...")
 
@@ -300,6 +302,38 @@ class CarEnv:
             self.collision_sensor.listen(lambda event: self.collision_hist.append(event))
             print("Collision callback set up")
 
+            # Initialize MPC controller
+            self.controller = MPCController()
+            print("MPC controller initialized")
+
+            # Get random destination point for MPC path
+            end_point = random.choice(spawn_points)
+            while end_point.location.distance(spawn_point.location) < 100:
+                end_point = random.choice(spawn_points)
+
+            # Set path using A*
+            success = self.controller.set_path(
+                self.world,
+                spawn_point.location,
+                end_point.location
+            )
+
+            if not success:
+                print("Failed to find path! Trying another destination...")
+                # Try another destination if path finding fails
+                for _ in range(5):  # Try up to 5 times
+                    end_point = random.choice(spawn_points)
+                    success = self.controller.set_path(
+                        self.world,
+                        spawn_point.location,
+                        end_point.location
+                    )
+                    if success:
+                        break
+                    
+                if not success:
+                    raise Exception("Failed to find a valid path after multiple attempts")
+
             # Wait for sensors to initialize
             for _ in range(10):  # Wait up to 10 ticks
                 self.world.tick()
@@ -324,16 +358,13 @@ class CarEnv:
         """Clean up all spawned actors"""
         try:
             print("Starting cleanup of actors...")
-
             # Clean up sensors and vehicle
             if hasattr(self, 'collision_sensor') and self.collision_sensor and self.collision_sensor.is_alive:
                 self.collision_sensor.destroy()
                 print("Collision sensor destroyed")
-
             if hasattr(self, 'camera') and self.camera and self.camera.is_alive:
                 self.camera.destroy()
-                print("Camera destroyed")
-
+                print("Camera destroyed") 
             if hasattr(self, 'vehicle') and self.vehicle and self.vehicle.is_alive:
                 self.vehicle.destroy()
                 print("Vehicle destroyed")
@@ -343,8 +374,11 @@ class CarEnv:
             self.vehicle = None
             self.front_camera = None
 
-            print("Cleanup completed successfully")
+            # Clear MPC controller
+            self.controller = None
+            print("MPC controller cleared")
 
+            print("Cleanup completed successfully")
         except Exception as e:
             print(f"Error cleaning up actors: {e}")
             import traceback
@@ -549,96 +583,144 @@ class CarEnv:
 
         return np.array(state_array, dtype=np.float16)
     
+
     def calculate_reward(self):
-        """Improved reward function to encourage movement and exploration"""
+        """Improved reward function to encourage movement, exploration, and obstacle avoidance"""
         try:
             reward = 0.0
             done = False
             info = {}
-            
+
             # Get current state
             velocity = self.vehicle.get_velocity()
             speed = 3.6 * math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)  # km/h
             location = self.vehicle.get_location()
-            
+
             # Base reward for staying alive
             reward += 0.1
-            
+
             # Speed reward
             target_speed = 30.0  # Target speed in km/h
             if speed < 1.0:  # Almost stopped
-                reward -= 0.5  # Larger penalty for not moving
-                self.stuck_time += 0.1
-                if self.stuck_time > 3.0:  # Reduced from 5.0 to 3.0
-                    done = True
-                    reward -= 10.0
-                    info['termination_reason'] = 'stuck'
+                # Check if there are obstacles nearby that justify stopping
+                detections = self.process_yolo_detection(self.front_camera)
+                near_obstacle = any(obj['depth'] < 10.0 and 
+                                   obj['class_name'] in ['car', 'truck', 'bus', 'person', 'traffic light']
+                                   for obj in detections)
+
+                if near_obstacle:
+                    # It's good to stop near obstacles
+                    reward += 1.0
+                else:
+                    # No reason to stop
+                    reward -= 0.5
+                    self.stuck_time += 0.1
+                    if self.stuck_time > 3.0:
+                        done = True
+                        reward -= 10.0
+                        info['termination_reason'] = 'stuck'
             else:
                 self.stuck_time = 0
                 # Reward for moving at appropriate speed
                 speed_reward = -abs(speed - target_speed) / target_speed
                 reward += speed_reward
-            
+
             # Distance traveled reward
             if self.last_location is not None:
                 distance_traveled = location.distance(self.last_location)
                 reward += distance_traveled * 0.5  # Reward for covering distance
-            
+
             # Collision penalty
             if len(self.collision_hist) > 0:
                 reward -= 50.0
                 done = True
                 info['termination_reason'] = 'collision'
-            
+
             # Lane keeping reward
             waypoint = self.world.get_map().get_waypoint(location)
             distance_from_center = location.distance(waypoint.transform.location)
             if distance_from_center < 1.0:
                 reward += 0.2
-            
+
             # Store current location for next step
             self.last_location = location
-            
+
             info['speed'] = speed
             info['reward'] = reward
             info['distance_from_center'] = distance_from_center
-            
+
             return reward, done, info
-            
+
         except Exception as e:
             print(f"Error in calculate_reward: {e}")
             traceback.print_exc()
             return 0.0, True, {'error': str(e)}
-    
-    def step(self, action):
+
+    def step(self, rl_action=None):
+        """Execute step with hybrid MPC and RL control"""
         try:
-            # Ensure actions are properly scaled
-            throttle = float(np.clip((action[1] + 1) / 2, 0.0, 1.0))  # Convert from [-1,1] to [0,1]
-            steer = float(np.clip(action[0], -1.0, 1.0))
+            # Get control input from MPC (default behavior)
+            if self.vehicle and self.controller:
+                mpc_control = self.controller.get_control(self.vehicle, self.world)
 
-            # Get current control
-            current_control = self.vehicle.get_control()
+                # Default to MPC control
+                control = mpc_control
+                control_source = "MPC"
 
-            # Smooth control changes
-            smooth_throttle = 0.8 * current_control.throttle + 0.2 * throttle
-            smooth_steer = 0.8 * current_control.steer + 0.2 * steer
+                # Process YOLO detections to check for obstacles
+                detections = self.process_yolo_detection(self.front_camera)
 
-            # Apply brake only when reducing speed
-            brake = 0.0
-            if throttle < current_control.throttle:
-                brake = min((current_control.throttle - throttle) * 2.0, 1.0)
+                # Check for nearby obstacles (vehicles, pedestrians, traffic signals)
+                nearby_obstacle = False
+                for obj in detections:
+                    # If object is close and is a vehicle, pedestrian, or traffic light
+                    if (obj['depth'] < 15.0 and 
+                        obj['class_name'] in ['car', 'truck', 'bus', 'person', 'traffic light']):
+                        nearby_obstacle = True
+                        break
+                    
+                # If we need to override with RL control
+                if nearby_obstacle and rl_action is not None:
+                    # Convert RL action to control
+                    throttle = float(np.clip((rl_action[1] + 1) / 2, 0.0, 1.0))  # Convert from [-1,1] to [0,1]
+                    steer = float(np.clip(rl_action[0], -1.0, 1.0))
 
-            # Create and apply control
-            control = carla.VehicleControl(
-                throttle=smooth_throttle,
-                steer=smooth_steer,
-                brake=brake,
-                hand_brake=False,
-                reverse=False,
-                manual_gear_shift=False
-            )
+                    # Current control for smooth transition
+                    current_control = self.vehicle.get_control()
 
-            self.vehicle.apply_control(control)
+                    # Smooth control changes (more aggressive than normal since this is override)
+                    smooth_throttle = 0.6 * current_control.throttle + 0.4 * throttle
+                    smooth_steer = 0.6 * current_control.steer + 0.4 * steer
+
+                    # Apply brake only when reducing speed (more aggressive for emergency)
+                    brake = 0.0
+                    if throttle < current_control.throttle:
+                        brake = min((current_control.throttle - throttle) * 3.0, 1.0)
+
+                    # Create RL control
+                    control = carla.VehicleControl(
+                        throttle=smooth_throttle,
+                        steer=smooth_steer,
+                        brake=brake,
+                        hand_brake=False,
+                        reverse=False,
+                        manual_gear_shift=False
+                    )
+                    control_source = "RL"
+
+                # Apply the final control (either MPC or RL)
+                self.vehicle.apply_control(control)
+
+                # Store current control values for info
+                control_info = {
+                    'throttle': control.throttle,
+                    'steer': control.steer,
+                    'brake': control.brake,
+                    'control_source': control_source,
+                    'nearby_obstacle': nearby_obstacle
+                }
+            else:
+                return None, 0, True, {'error': 'Vehicle or controller not available'}
 
             # Tick the world multiple times for better physics
             for _ in range(4):
@@ -649,9 +731,7 @@ class CarEnv:
             reward, done, info = self.calculate_reward()
 
             # Add control info for debugging
-            info['throttle'] = smooth_throttle
-            info['steer'] = smooth_steer
-            info['brake'] = brake
+            info.update(control_info)
 
             return new_state, reward, done, info
 
@@ -659,9 +739,74 @@ class CarEnv:
             print(f"Error in step: {e}")
             traceback.print_exc()
             return None, 0, True, {'error': str(e)}
+
+    def run(self):
+        """Main game loop using MPC controller"""
+        try:
+            running = True
+            while running:
+                # Handle pygame events
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+                    elif event.type == pygame.KEYUP:
+                        if event.key == pygame.K_r:
+                            # Reset simulation
+                            self.reset()
+                        elif event.key == pygame.K_p:
+                            # Reset path
+                            self.reset_path()
+
+                # Execute step with MPC controller
+                _, reward, done, info = self.step()
+
+                # Handle termination
+                if done:
+                    print(f"Episode terminated: {info.get('termination_reason', 'unknown')}")
+                    self.reset()
+
+                # Maintain fps
+                if self.clock:
+                    self.clock.tick(20)
+
+        except KeyboardInterrupt:
+            print("Interrupted by user")
+        finally:
+            # Cleanup
+            self.cleanup_actors()
+            pygame.quit()
+
+            # Disable synchronous mode
+            settings = self.world.get_settings()
+            settings.synchronous_mode = False
+            self.world.apply_settings(settings)
+
+    def reset_path(self):
+        """Reset the MPC controller path with a new destination"""
+        if self.vehicle and self.controller:
+            # Get current location
+            start_location = self.vehicle.get_location()
+
+            # Get random destination point
+            spawn_points = self.world.get_map().get_spawn_points()
+            if not spawn_points:
+                return False
+
+            end_point = random.choice(spawn_points)
+            while end_point.location.distance(start_location) < 100:
+                end_point = random.choice(spawn_points)
+
+            # Set path using A*
+            success = self.controller.set_path(
+                self.world,
+                start_location,
+                end_point.location
+            )
+
+            return success
+
+        return False
     
-
-
     def spawn_npcs(self):
         """Spawn NPC vehicles near the training vehicle"""
         try:

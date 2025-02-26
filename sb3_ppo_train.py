@@ -16,7 +16,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNorm
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.evaluation import evaluate_policy
-
+from carla_env import CarEnv
 # Custom wrapper for your CarEnv to make it gym-compatible
 class CarlaGymEnv(gym.Env):
     """Custom Environment that follows gym interface for CARLA environment"""
@@ -27,7 +27,6 @@ class CarlaGymEnv(gym.Env):
         
         # Create or use provided CARLA environment
         if carla_env is None:
-            from carla_env import CarEnv  # Import your CarEnv class
             self.env = CarEnv()
         else:
             self.env = carla_env
@@ -246,12 +245,13 @@ def optimize_ppo(trial):
         env.close()
         return -1000  # Return a poor score on failure
         
-def train_ppo(num_envs=1, total_timesteps=1000000, hyperparameter_tuning=False, 
+def train_ppo(env=None, num_envs=1, total_timesteps=1000000, hyperparameter_tuning=False, 
               continue_training=False, checkpoint_path=None):
     """
     Train the PPO agent with all the advanced features
     
     Parameters:
+        env: Pre-initialized CarlaEnv instance (optional)
         num_envs: Number of parallel environments
         total_timesteps: Total timesteps to train for
         hyperparameter_tuning: Whether to run hyperparameter optimization
@@ -266,20 +266,28 @@ def train_ppo(num_envs=1, total_timesteps=1000000, hyperparameter_tuning=False,
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(save_dir, exist_ok=True)
     
+    # Use provided environment or create a new one
+    if env is None:
+        print("Creating new CarlaEnv instance...")
+        base_env = CarlaGymEnv()
+    else:
+        print("Using provided CarlaEnv instance...")
+        base_env = CarlaGymEnv(carla_env=env)
+    
     # Create vectorized environments
     if num_envs > 1:
         print(f"Creating {num_envs} parallel environments...")
         env = SubprocVecEnv([make_env("CarlaGymEnv", i) for i in range(num_envs)])
     else:
-        print("Creating single environment...")
-        env = DummyVecEnv([lambda: CarlaGymEnv()])
+        print("Creating single vectorized environment...")
+        env = DummyVecEnv([lambda: base_env])
     
     # Add normalization wrapper for observations and rewards
     if continue_training and os.path.exists(f"{os.path.dirname(checkpoint_path)}/vec_normalize.pkl"):
         print(f"Loading normalization statistics from {os.path.dirname(checkpoint_path)}/vec_normalize.pkl")
         env = VecNormalize.load(f"{os.path.dirname(checkpoint_path)}/vec_normalize.pkl", env)
         # Don't update normalization statistics if not needed
-        # env.training = True  # Set to False if you don't want to update normalization statistics
+        env.training = True
         env.norm_reward = True
     else:
         env = VecNormalize(
@@ -325,7 +333,13 @@ def train_ppo(num_envs=1, total_timesteps=1000000, hyperparameter_tuning=False,
     )
     
     # Separate environment for evaluation
-    eval_env = DummyVecEnv([lambda: CarlaGymEnv()])
+    if env is None:
+        eval_base_env = CarlaGymEnv()
+    else:
+        # eval_base_env = CarlaGymEnv(carla_env=env.env)
+        eval_base_env = CarlaGymEnv(carla_env=env.envs[0].env)
+        
+    eval_env = DummyVecEnv([lambda: eval_base_env])
     eval_env = VecNormalize.load(f"{save_dir}/vec_normalize.pkl", eval_env) if os.path.exists(f"{save_dir}/vec_normalize.pkl") else VecNormalize(eval_env)
     # Don't update the normalization statistics during evaluation
     eval_env.training = False
@@ -342,15 +356,7 @@ def train_ppo(num_envs=1, total_timesteps=1000000, hyperparameter_tuning=False,
     
     callback_list = CallbackList([checkpoint_callback, monitor_callback, eval_callback])
     
-
     # Define policy kwargs
-    # Uncomment to use the custom feature extractor
-    # policy_kwargs = {
-    #     "features_extractor_class": CustomFeatureExtractor,
-    #     "features_extractor_kwargs": {"features_dim": 128}
-    # }
-    # Define policy kwargs
-    
     policy_kwargs = {
         "net_arch": [dict(pi=[128, 64], vf=[128, 64])]
     }
@@ -430,23 +436,38 @@ def train_ppo(num_envs=1, total_timesteps=1000000, hyperparameter_tuning=False,
         
     return model
 
-# Evaluate the trained model
-def evaluate_model(model_path, num_episodes=10):
+def evaluate_model(model_path_or_params, env=None, num_episodes=10):
     """
     Evaluate a trained PPO model
+    
+    Parameters:
+        model_path_or_params: Path to model file or model parameters
+        env: Pre-initialized CarlaEnv instance (optional)
+        num_episodes: Number of episodes to evaluate
     """
-    # Load the environment
-    env = CarlaGymEnv()
-    env = Monitor(env)
-    
-    # Load the model
-    model = PPO.load(model_path)
-    
     try:
-        print(f"Evaluating model: {model_path}")
+        # Load or create the environment
+        if env is None:
+            print("Creating new environment for evaluation...")
+            eval_env = CarlaGymEnv()
+        else:
+            print("Using provided environment for evaluation...")
+            eval_env = CarlaGymEnv(carla_env=env)
+            
+        eval_env = Monitor(eval_env)
+        
+        # Load the model
+        if isinstance(model_path_or_params, str):
+            print(f"Loading model from {model_path_or_params}")
+            model = PPO.load(model_path_or_params)
+        else:
+            print("Using provided model parameters")
+            model = model_path_or_params
+        
+        print(f"Evaluating model for {num_episodes} episodes...")
         mean_reward, std_reward = evaluate_policy(
             model, 
-            env, 
+            eval_env, 
             n_eval_episodes=num_episodes,
             deterministic=True
         )
@@ -457,73 +478,120 @@ def evaluate_model(model_path, num_episodes=10):
         episode_lengths = []
         speeds = []
         collisions = 0
+        lane_deviations = []
         
         for i in range(num_episodes):
-            obs, _ = env.reset()
+            obs, _ = eval_env.reset()
             done = False
             episode_length = 0
+            episode_speeds = []
+            episode_lane_devs = []
             
             while not done:
                 action, _ = model.predict(obs, deterministic=True)
-                obs, reward, done, _, info = env.step(action)
+                obs, reward, done, _, info = eval_env.step(action)
                 episode_length += 1
                 
                 if 'speed' in info:
-                    speeds.append(info['speed'])
-                if 'collision' in info:
+                    episode_speeds.append(info['speed'])
+                if 'collision' in info and info['collision']:
                     collisions += 1
+                if 'distance_from_center' in info:
+                    episode_lane_devs.append(info['distance_from_center'])
             
             episode_lengths.append(episode_length)
-            print(f"Episode {i+1}: Length = {episode_length}")
+            if episode_speeds:
+                speeds.append(np.mean(episode_speeds))
+            if episode_lane_devs:
+                lane_deviations.append(np.mean(episode_lane_devs))
+                
+            print(f"Episode {i+1}: Length = {episode_length}, Avg Speed = {np.mean(episode_speeds) if episode_speeds else 0:.2f}, "
+                  f"Max Lane Dev = {max(episode_lane_devs) if episode_lane_devs else 0:.2f}")
         
         # Print summary statistics
         print("\nEvaluation Summary:")
         print(f"Average Episode Length: {np.mean(episode_lengths):.2f}")
         print(f"Average Speed: {np.mean(speeds):.2f} km/h")
+        print(f"Average Lane Deviation: {np.mean(lane_deviations):.2f} m")
         print(f"Total Collisions: {collisions}")
+        
+        return mean_reward, std_reward
         
     except Exception as e:
         print(f"Evaluation error: {e}")
         import traceback
         traceback.print_exc()
+        return None, None
     finally:
-        env.close()
+        if 'eval_env' in locals():
+            eval_env.close()
 
-if __name__ == "__main__":
+def main():
+    """Main function to run CARLA environment with MPC controller integration"""
     # Set random seeds for reproducibility
     set_random_seed(42)
     
-    # Whether to tune hyperparameters first
+    # Configuration parameters
+    TRAIN_RL = True  # Set to False to run only with MPC controller
+    EVALUATE_ONLY = False  # Set to True to only evaluate without training
     TUNE_HYPERPARAMETERS = False
-    
-    # Whether to continue training from a checkpoint
     CONTINUE_TRAINING = True
-    CHECKPOINT_PATH = "models/ppo_carla_model_990000_steps.zip"  # Specify your checkpoint path here
+    CHECKPOINT_PATH = "models/ppo_carla_model_990000_steps.zip"  # Your checkpoint path
     
     try:
-        print("Starting CARLA PPO training with Stable Baselines3")
+        print("Starting CARLA with hybrid MPC-RL control system")
         print(f"Device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
         
-        # Train the model
+        # Initialize the CarlaEnv with MPC controller
+        env = CarEnv()
+        if not env.setup_vehicle():
+            print("Failed to set up CARLA environment")
+            return
+        
+        # If we're just running with the MPC controller
+        if not TRAIN_RL:
+            print("Running with MPC controller only...")
+            env.run()
+            return
+            
+        # If we're only evaluating a trained model
+        if EVALUATE_ONLY:
+            print("Evaluating model with MPC controller...")
+            if os.path.exists(CHECKPOINT_PATH):
+                evaluate_model(CHECKPOINT_PATH, env=env)
+            else:
+                print(f"Checkpoint not found at {CHECKPOINT_PATH}")
+            return
+        
+        # Train the PPO model with MPC controller for lane keeping and path following
         model = train_ppo(
-            num_envs=1,  # Number of parallel environments
-            total_timesteps=1_000_000,  # Total timesteps to train for
-            hyperparameter_tuning=TUNE_HYPERPARAMETERS,  # Whether to run hyperparameter tuning
-            continue_training=CONTINUE_TRAINING,  # Whether to continue from a checkpoint
-            checkpoint_path=CHECKPOINT_PATH if CONTINUE_TRAINING else None  # Path to the checkpoint
+            env=env,  # Pass the CARLA environment with MPC
+            num_envs=1,
+            total_timesteps=1_000_000,
+            hyperparameter_tuning=TUNE_HYPERPARAMETERS,
+            continue_training=CONTINUE_TRAINING,
+            checkpoint_path=CHECKPOINT_PATH if CONTINUE_TRAINING else None
         )
         
         # Evaluate the best model
         best_model_path = "models/best_model/best_model.zip"
         if os.path.exists(best_model_path):
             print("\nEvaluating best model...")
-            evaluate_model(best_model_path)
+            evaluate_model(best_model_path, env=env)
         
     except KeyboardInterrupt:
-        print("\nProgram terminated by user")
+        print('\nCancelled by user. Bye!')
     except Exception as e:
         print(f"Unexpected error: {e}")
         import traceback
         traceback.print_exc()
     finally:
         print("Program terminated")
+        # Make sure to clean up CARLA actors
+        if 'env' in locals() and hasattr(env, 'cleanup_actors'):
+            env.cleanup_actors()
+        if 'env' in locals() and hasattr(env, 'cleanup_npcs'):
+            env.cleanup_npcs()
+
+if __name__ == '__main__':
+    main()
