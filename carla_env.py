@@ -61,32 +61,41 @@ IM_WIDTH = 640
 IM_HEIGHT = 480
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def calculate_depth(bbox, class_id, image_width=IM_WIDTH, image_height=IM_HEIGHT, fov=90):
+def calculate_spatial_info(bbox, class_id, image_width=IM_WIDTH, image_height=IM_HEIGHT, fov=90):
     """
-    Calculate depth using bounding box and class-specific real-world dimensions
+    Calculate depth and relative position using bounding box and class-specific dimensions
+    
+    Returns:
+        - depth: estimated distance to object in meters
+        - confidence: confidence in the depth estimate
+        - relative_angle: angle to object in degrees (0 = straight ahead, negative = left, positive = right)
+        - normalized_x_pos: horizontal position in normalized coordinates (-1 to 1, where 0 is center)
+        - lane_position: estimated lane position relative to ego vehicle (-1: left lane, 0: same lane, 1: right lane)
     """
     bbox_width = bbox[2] - bbox[0]
-    
     bbox_height = bbox[3] - bbox[1]
     
-    # Define typical widths for different object classes
-    # These values are approximate averages in meters
+    # Center of the bounding box
+    center_x = (bbox[0] + bbox[2]) / 2
+    center_y = (bbox[1] + bbox[3]) / 2
+    
+    # Define typical widths for different object classes (in meters)
     REAL_WIDTHS = {
         0: 0.45,   # person - average shoulder width
-    
-    # Vehicles
-    1: 0.8,    # bicycle - typical handlebar width
-    2: 0.8,    # motorcycle - typical handlebar width
-    3: 1.8,    # car - average car width
-    4: 2.5,    # truck - average truck width
-    5: 2.9,    # bus - average bus width
-    6: 3.0,    # train - typical train car width
-    
-    # Outdoor objects
-    7: 0.6,    # fire hydrant - typical width
-    8: 0.3,    # stop sign - standard width
-    9: 0.3,    # parking meter - typical width
-    10: 0.4,   # bench - typical seat width
+        
+        # Vehicles
+        1: 0.8,    # bicycle - typical handlebar width
+        2: 0.8,    # motorcycle - typical handlebar width
+        3: 1.8,    # car - average car width
+        4: 2.5,    # truck - average truck width
+        5: 2.9,    # bus - average bus width
+        6: 3.0,    # train - typical train car width
+        
+        # Outdoor objects
+        7: 0.6,    # fire hydrant - typical width
+        8: 0.3,    # stop sign - standard width
+        9: 0.3,    # parking meter - typical width
+        10: 0.4,   # bench - typical seat width
     }
     
     # Get real width based on class, default to car width if class not found
@@ -101,10 +110,56 @@ def calculate_depth(bbox, class_id, image_width=IM_WIDTH, image_height=IM_HEIGHT
     else:
         depth = float('inf')
     
-    # Add confidence measure based on bbox size
-    confidence = min(1.0, bbox_width / image_width)  # Higher confidence for larger objects
+    # Horizontal position normalized to [-1, 1] where 0 is center
+    normalized_x_pos = (center_x - (image_width / 2)) / (image_width / 2)
     
-    return depth, confidence
+    # Calculate relative angle in degrees
+    relative_angle = np.degrees(np.arctan2(normalized_x_pos * np.tan(np.radians(fov / 2)), 1))
+    
+    # Estimate lane position
+    # This is a simple heuristic based on horizontal position and object width
+    # More sophisticated lane detection would use road markings
+    if abs(normalized_x_pos) < 0.2:
+        # Object is roughly centered - likely in same lane
+        lane_position = 0
+    elif normalized_x_pos < 0:
+        # Object is to the left
+        lane_position = -1
+    else:
+        # Object is to the right
+        lane_position = 1
+    
+    # For vehicles (class 1-6), refine lane estimation based on size and position
+    if 1 <= class_id <= 6:
+        # Calculate expected width at this depth if in same lane
+        expected_width_in_px = (real_width * focal_length) / depth
+        
+        # Ratio of actual width to expected width if centered
+        width_ratio = bbox_width / expected_width_in_px
+        
+        # If object seems too small for its position, might be in adjacent lane
+        if width_ratio < 0.7 and abs(normalized_x_pos) < 0.4:
+            # Object appears smaller than expected for this position
+            if normalized_x_pos < 0:
+                lane_position = -1
+            else:
+                lane_position = 1
+    
+    # Calculate confidence based on multiple factors
+    size_confidence = min(1.0, bbox_width / (image_width * 0.5))  # Higher confidence for larger objects
+    center_confidence = 1.0 - abs(normalized_x_pos)  # Higher confidence for centered objects
+    aspect_confidence = min(1.0, bbox_height / (bbox_width + 1e-6) / 0.75)  # Expected aspect ratio
+    
+    # Combined confidence score
+    confidence = (size_confidence * 0.5 + center_confidence * 0.3 + aspect_confidence * 0.2)
+    
+    return {
+        'depth': depth,
+        'confidence': confidence,
+        'relative_angle': relative_angle,
+        'normalized_x_pos': normalized_x_pos,
+        'lane_position': lane_position
+    }
 
 class CarEnv:
     def __init__(self):
@@ -452,28 +507,28 @@ class CarEnv:
             raise
 
     def process_yolo_detection(self, image):
-        """Process image with YOLO and return detections"""
+        """Process image with YOLO and return detections with enhanced spatial information"""
         if image is None:
             return []
-        
+
         try:
             # Prepare image for YOLO
             img = cv2.resize(image, (640, 640))
             img = img.transpose((2, 0, 1))  # HWC to CHW
             img = np.ascontiguousarray(img)
-            
+
             # Convert to torch tensor
             img = torch.from_numpy(img).to(DEVICE)
             img = img.float()  # uint8 to fp16/32
             img /= 255.0  # 0 - 255 to 0.0 - 1.0
-            
+
             if img.ndimension() == 3:
                 img = img.unsqueeze(0)
-            
+
             # Inference
             with torch.no_grad():
                 pred = self.yolo_model(img)[0]
-            
+
             # Apply NMS
             from utils.general import non_max_suppression
             pred = non_max_suppression(pred, 
@@ -482,39 +537,127 @@ class CarEnv:
                                      classes=None,
                                      agnostic=False,
                                      max_det=300)
-            
+
             objects = []
             if len(pred[0]):
                 # Process detections
                 for *xyxy, conf, cls in pred[0]:
                     x1, y1, x2, y2 = map(float, xyxy)
-                    depth, depth_confidence = calculate_depth([x1, y1, x2, y2], int(cls))
-                    
+
+                    # Get enhanced spatial information
+                    spatial_info = calculate_spatial_info([x1, y1, x2, y2], int(cls))
+
+                    # Calculate time-to-collision (TTC) if vehicle is moving
+                    ttc = float('inf')
+                    if hasattr(self, 'vehicle') and self.vehicle:
+                        velocity = self.vehicle.get_velocity()
+                        speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)  # m/s
+
+                        # Only calculate TTC for objects roughly in our path
+                        if abs(spatial_info['relative_angle']) < 30 and speed > 0.5:
+                            ttc = spatial_info['depth'] / speed  # seconds
+
+                    # Get class name and parse traffic light color
+                    class_name = self.yolo_model.names[int(cls)]
+                    traffic_light_color = None
+
+                    # Parse traffic light color from the class name
+                    # Assuming your YOLO model is trained to classify traffic lights with color
+                    # e.g. "traffic_light_red", "traffic_light_green", "traffic_light_yellow"
+                    if "traffic_light" in class_name:
+                        if "red" in class_name:
+                            traffic_light_color = "red"
+                        elif "yellow" in class_name:
+                            traffic_light_color = "yellow"
+                        elif "green" in class_name:
+                            traffic_light_color = "green"
+
+                    # Create enriched object dictionary
                     objects.append({
                         'position': ((x1 + x2) / 2, (y1 + y2) / 2),
-                        'depth': depth,
-                        'depth_confidence': depth_confidence,
+                        'depth': spatial_info['depth'],
+                        'depth_confidence': spatial_info['confidence'],
+                        'relative_angle': spatial_info['relative_angle'],
+                        'normalized_x_pos': spatial_info['normalized_x_pos'],
+                        'lane_position': spatial_info['lane_position'],
+                        'time_to_collision': ttc,
                         'class': int(cls),
-
-
-                        
-                        'class_name': self.yolo_model.names[int(cls)],
-                        'confidence': float(conf),
+                        'class_name': class_name,
+                        'traffic_light_color': traffic_light_color,  # New field for traffic light color
+                        'detection_confidence': float(conf),
                         'bbox_width': x2 - x1,
-                        'bbox_height': y2 - y1
+                        'bbox_height': y2 - y1,
+                        # Add a risk score based on TTC, position and object type
+                        'risk_score': self._calculate_risk_score(
+                            spatial_info['depth'],
+                            spatial_info['lane_position'],
+                            ttc,
+                            int(cls),
+                            traffic_light_color  # Pass traffic light color to risk calculation
+                        )
                     })
-            
-            # Sort by depth and confidence
-            objects.sort(key=lambda x: x['depth'] * (1 - x['depth_confidence']))
+
+            # Sort by risk score (higher risk first)
+            objects.sort(key=lambda x: x['risk_score'], reverse=True)
             return objects[:self.max_objects]
-            
+
         except Exception as e:
             print(f"Error in YOLO detection: {e}")
             import traceback
             traceback.print_exc()
             return []
-    
-    
+
+    def _calculate_risk_score(self, depth, lane_position, ttc, class_id, traffic_light_color=None):
+        """Calculate risk score for object based on multiple factors including traffic light status"""
+        # Base risk inversely proportional to distance
+        distance_factor = 10.0 / max(1.0, depth)
+
+        # Lane position factor (higher if in same lane)
+        lane_factor = 1.0 if lane_position == 0 else 0.3
+
+        # Time to collision factor (higher for imminent collisions)
+        ttc_factor = 1.0 if ttc < 3.0 else (0.5 if ttc < 6.0 else 0.2)
+
+        # Object type factor (higher for vehicles and pedestrians)
+        type_factors = {
+            0: 1.0,  # person - highest risk
+            1: 0.7,  # bicycle
+            2: 0.8,  # motorcycle
+            3: 0.9,  # car
+            4: 1.0,  # truck - highest risk due to size
+            5: 1.0,  # bus - highest risk due to size
+            6: 0.8,  # train
+            7: 0.3,  # fire hydrant
+            8: 0.8,  # stop sign - important for traffic rules
+            9: 0.3,  # parking meter
+            10: 0.3, # bench
+        }
+
+        # Get base type factor
+        class_name = self.yolo_model.names[class_id] if hasattr(self, 'yolo_model') else ""
+        is_traffic_light = "traffic_light" in class_name
+
+        # Default to standard type factor
+        type_factor = type_factors.get(class_id, 0.5)
+
+        # Traffic light color modifies risk significantly
+        if is_traffic_light and traffic_light_color:
+            if traffic_light_color == "red":
+                # Red light is high risk if we're moving
+                velocity = self.vehicle.get_velocity() if hasattr(self, 'vehicle') else None
+                speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2) if velocity else 0
+
+                # Higher risk for red light when moving fast
+                type_factor = 1.5 if speed > 5.0 else 1.0
+            elif traffic_light_color == "yellow":
+                type_factor = 0.9  # Yellow is medium risk
+            elif traffic_light_color == "green":
+                type_factor = 0.2  # Green is low risk
+
+        # Combine factors
+        risk_score = distance_factor * lane_factor * ttc_factor * type_factor
+        return risk_score
+     
     def get_waypoint_info(self):
         """Get waypoint information"""
         location = self.vehicle.get_location()
@@ -547,27 +690,52 @@ class CarEnv:
         }
     
     def get_state(self):
-        """Get complete state information"""
+        """Get enhanced state representation with improved spatial awareness including traffic lights"""
         if self.front_camera is None:
             return None
 
         # Initialize state array
         state_array = []
 
-        # 1. Process YOLO detections (max_objects * 3 features)
+        # 1. Process YOLO detections with enhanced spatial information
         detections = self.process_yolo_detection(self.front_camera)
+
+        # Track if we have a traffic light in our detections
+        traffic_light_detected = False
+        traffic_light_features = [0.0, 0.0, 0.0, 100.0]  # [red, yellow, green, distance]
+
+        # Create a feature vector for each detected object
         for obj in detections:
+            # Special handling for traffic lights
+            if "traffic_light" in obj['class_name']:
+                traffic_light_detected = True
+                color = obj.get('traffic_light_color')
+                if color == "red":
+                    traffic_light_features = [1.0, 0.0, 0.0, obj['depth'] / 100.0]
+                elif color == "yellow":
+                    traffic_light_features = [0.0, 1.0, 0.0, obj['depth'] / 100.0]
+                elif color == "green":
+                    traffic_light_features = [0.0, 0.0, 1.0, obj['depth'] / 100.0]
+
+                # Continue processing the traffic light as a regular object too
+
             state_array.extend([
-                obj['position'][0] / IM_WIDTH,     # x position normalized
-                obj['position'][1] / IM_HEIGHT,    # y position normalized
-                obj['depth'] / 100.0               # depth normalized
+                obj['normalized_x_pos'],            # Horizontal position (-1 to 1)
+                obj['depth'] / 100.0,               # Normalized depth 
+                obj['relative_angle'] / 90.0,       # Normalized angle (-1 to 1)
+                float(obj['lane_position']),        # Lane position (-1, 0, 1)
+                min(1.0, 10.0 / max(0.1, obj['time_to_collision'])),  # Time-to-collision normalized
+                obj['risk_score'] / 10.0            # Normalized risk score
             ])
 
         # Pad if fewer than max objects
         remaining_objects = self.max_objects - len(detections)
-        state_array.extend([0.0] * (remaining_objects * 3))
+        state_array.extend([0.0] * (remaining_objects * 6))  # 6 features per object
 
-        # 2. Get waypoint information
+        # Add traffic light information
+        state_array.extend(traffic_light_features)  # [red, yellow, green, distance]
+
+        # 2. Get waypoint information for path following
         waypoint_info = self.get_waypoint_info()
         state_array.extend([
             waypoint_info['distance'] / 50.0,      # distance normalized
@@ -581,11 +749,169 @@ class CarEnv:
             vehicle_state['steering']              # steering already normalized
         ])
 
+        # 4. Add lane-specific information
+        try:
+            # Get location and waypoint
+            location = self.vehicle.get_location()
+            waypoint = self.world.get_map().get_waypoint(location)
+
+            # Get left and right lane markings
+            has_left_lane = 1.0 if waypoint.get_left_lane() is not None else 0.0
+            has_right_lane = 1.0 if waypoint.get_right_lane() is not None else 0.0
+
+            # Add lane info to state
+            state_array.extend([
+                has_left_lane,
+                has_right_lane,
+                float(waypoint.lane_id),
+                float(waypoint.lane_width) / 4.0  # Normalize typical lane width
+            ])
+        except:
+            # Fallback if lane info can't be accessed
+            state_array.extend([0.0, 0.0, 0.0, 0.75])
+
         return np.array(state_array, dtype=np.float16)
     
 
+    # def calculate_reward(self):
+    #     """Improved reward function with traffic light rules and obstacle avoidance"""
+    #     try:
+    #         reward = 0.0
+    #         done = False
+    #         info = {}
+
+    #         # Get current state
+    #         velocity = self.vehicle.get_velocity()
+    #         speed = 3.6 * math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)  # km/h
+    #         location = self.vehicle.get_location()
+
+    #         # Process YOLO detections to get traffic information
+    #         detections = self.process_yolo_detection(self.front_camera)
+    #         safety_info = self._analyze_safety(detections)
+
+    #         # Traffic light checks
+    #         approaching_red_light = safety_info['approaching_red_light']
+    #         approaching_yellow_light = safety_info['approaching_yellow_light'] 
+    #         approaching_green_light = safety_info['approaching_green_light']
+    #         traffic_light_distance = safety_info['traffic_light_distance']
+
+    #         # Base reward for staying alive
+    #         reward += 0.1
+
+    #         # Traffic light behavior rewards
+    #         if approaching_red_light:
+    #             if traffic_light_distance < 20.0:
+    #                 if speed < 5.0:  # Good behavior: stopping at red light
+    #                     reward += 5.0
+    #                     info['traffic_behavior'] = 'stopped_at_red'
+    #                 else:  # Bad behavior: speeding through red light
+    #                     reward -= 20.0
+    #                     info['traffic_violation'] = 'ran_red_light'
+    #                     # Don't end episode, but heavily penalize
+    #             elif traffic_light_distance < 40.0 and speed > 30.0:
+    #                 # Penalize for approaching red light too fast
+    #                 reward -= 2.0
+    #                 info['traffic_warning'] = 'approaching_red_too_fast'
+
+    #         elif approaching_yellow_light:
+    #             if traffic_light_distance < 15.0:
+    #                 if speed < 5.0:  # Safely stopped at yellow
+    #                     reward += 2.0
+    #                     info['traffic_behavior'] = 'stopped_at_yellow'
+    #                 elif speed > 30.0:  # Speeding through late yellow
+    #                     reward -= 1.0
+    #                     info['traffic_warning'] = 'speeding_through_yellow'
+    #             elif traffic_light_distance < 40.0 and speed > 50.0:
+    #                 # Penalize for approaching yellow too fast
+    #                 reward -= 0.5
+
+    #         elif approaching_green_light:
+    #             if traffic_light_distance < 20.0 and speed > 5.0:
+    #                 # Reward for proceeding through green light
+    #                 reward += 1.0
+    #                 info['traffic_behavior'] = 'proceeding_through_green'
+
+    #         # Speed reward (modified by traffic light conditions)
+    #         target_speed = 30.0  # Default target speed in km/h
+
+    #         # Adjust target speed based on traffic lights
+    #         if approaching_red_light and traffic_light_distance < 30.0:
+    #             target_speed = 0.0  # Should stop for red
+    #         elif approaching_yellow_light and traffic_light_distance < 20.0:
+    #             target_speed = 10.0  # Should slow for yellow
+
+    #         if speed < 1.0:  # Almost stopped
+    #             # Check if there are obstacles or red lights that justify stopping
+    #             near_obstacle = safety_info['nearest_same_lane_dist'] < 10.0
+    #             should_stop = near_obstacle or (approaching_red_light and traffic_light_distance < 20.0)
+
+    #             if should_stop:
+    #                 # It's good to stop for obstacles or red lights
+    #                 reward += 1.0
+    #                 if approaching_red_light:
+    #                     info['stop_reason'] = 'red_light'
+    #                 else:
+    #                     info['stop_reason'] = 'obstacle'
+    #             else:
+    #                 # No reason to stop
+    #                 reward -= 0.5
+    #                 self.stuck_time += 0.1
+    #                 if self.stuck_time > 3.0:
+    #                     done = True
+    #                     reward -= 10.0
+    #                     info['termination_reason'] = 'stuck'
+    #         else:
+    #             self.stuck_time = 0
+    #             # Reward for moving at appropriate speed
+    #             speed_reward = -abs(speed - target_speed) / target_speed
+    #             reward += speed_reward
+
+    #         # Distance traveled reward - reduced when approaching red/yellow
+    #         if self.last_location is not None:
+    #             distance_traveled = location.distance(self.last_location)
+    #             # Reduce distance reward when approaching red light
+    #             if approaching_red_light and traffic_light_distance < 30.0:
+    #                 reward += distance_traveled * 0.1  # Reduced reward
+    #             else:
+    #                 reward += distance_traveled * 0.5  # Normal reward
+
+    #         # Collision penalty
+    #         if len(self.collision_hist) > 0:
+    #             reward -= 50.0
+    #             done = True
+    #             info['termination_reason'] = 'collision'
+
+    #         # Lane keeping reward
+    #         waypoint = self.world.get_map().get_waypoint(location)
+    #         distance_from_center = location.distance(waypoint.transform.location)
+    #         if distance_from_center < 1.0:
+    #             reward += 0.2
+
+    #         # Store current location for next step
+    #         self.last_location = location
+
+    #         info['speed'] = speed
+    #         info['reward'] = reward
+    #         info['distance_from_center'] = distance_from_center
+
+    #         # Add traffic light info to debug info
+    #         info.update({
+    #             'red_light': approaching_red_light,
+    #             'yellow_light': approaching_yellow_light,
+    #             'green_light': approaching_green_light,
+    #             'traffic_light_distance': traffic_light_distance
+    #         })
+
+    #         return reward, done, info
+
+    #     except Exception as e:
+    #         print(f"Error in calculate_reward: {e}")
+    #         traceback.print_exc()
+    #         return 0.0, True, {'error': str(e)}
+
+
     def calculate_reward(self):
-        """Improved reward function to encourage movement, exploration, and obstacle avoidance"""
+        """Improved reward function focusing on speed control for RL agent"""
         try:
             reward = 0.0
             done = False
@@ -596,21 +922,90 @@ class CarEnv:
             speed = 3.6 * math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)  # km/h
             location = self.vehicle.get_location()
 
+            # Process YOLO detections to get traffic information
+            detections = self.process_yolo_detection(self.front_camera)
+            safety_info = self._analyze_safety(detections)
+
+            # Traffic light checks
+            approaching_red_light = safety_info['approaching_red_light']
+            approaching_yellow_light = safety_info['approaching_yellow_light'] 
+            approaching_green_light = safety_info['approaching_green_light']
+            traffic_light_distance = safety_info['traffic_light_distance']
+
+            # Obstacle checks
+            nearest_same_lane_dist = safety_info['nearest_same_lane_dist']
+            nearest_cross_lane_dist = safety_info['nearest_cross_lane_dist']
+
             # Base reward for staying alive
             reward += 0.1
 
-            # Speed reward
-            target_speed = 30.0  # Target speed in km/h
-            if speed < 1.0:  # Almost stopped
-                # Check if there are obstacles nearby that justify stopping
-                detections = self.process_yolo_detection(self.front_camera)
-                near_obstacle = any(obj['depth'] < 10.0 and 
-                                   obj['class_name'] in ['car', 'truck', 'bus', 'person', 'traffic light']
-                                   for obj in detections)
+            # Determine target speed based on environment conditions
+            target_speed = 30.0  # Default target speed in km/h
 
-                if near_obstacle:
-                    # It's good to stop near obstacles
+            # Adjust target speed based on traffic lights
+            if approaching_red_light and traffic_light_distance < 30.0:
+                target_speed = 0.0  # Should stop for red
+            elif approaching_yellow_light and traffic_light_distance < 20.0:
+                target_speed = 10.0  # Should slow for yellow
+            elif nearest_same_lane_dist < 15.0:
+                # Obstacle ahead - reduce speed based on distance
+                target_speed = max(0, min(30.0, nearest_same_lane_dist * 2))
+            elif approaching_green_light:
+                # Can proceed at normal speed through green
+                target_speed = 30.0
+
+            # Enhanced speed reward (more weight since this is RL's main responsibility)
+            speed_diff = abs(speed - target_speed)
+            if speed_diff < 5.0:  # Very close to target speed
+                speed_reward = 2.0
+            elif speed_diff < 10.0:  # Reasonably close
+                speed_reward = 1.0 - (speed_diff / 10.0)
+            else:  # Too far from target
+                speed_reward = -1.0 * (speed_diff / 10.0)
+
+            # Amplify speed reward since it's the primary RL task
+            reward += speed_reward * 2.0
+
+            # Traffic light behavior rewards
+            if approaching_red_light:
+                if traffic_light_distance < 20.0:
+                    if speed < 5.0:  # Good behavior: stopping at red light
+                        reward += 5.0
+                        info['traffic_behavior'] = 'stopped_at_red'
+                    else:  # Bad behavior: speeding through red light
+                        reward -= 20.0
+                        info['traffic_violation'] = 'ran_red_light'
+                        # Don't end episode, but heavily penalize
+                elif traffic_light_distance < 40.0 and speed > 30.0:
+                    # Penalize for approaching red light too fast
+                    reward -= 2.0
+                    info['traffic_warning'] = 'approaching_red_too_fast'
+
+            elif approaching_yellow_light:
+                if traffic_light_distance < 15.0:
+                    if speed < 5.0:  # Safely stopped at yellow
+                        reward += 2.0
+                        info['traffic_behavior'] = 'stopped_at_yellow'
+                    elif speed > 30.0:  # Speeding through late yellow
+                        reward -= 1.0
+                        info['traffic_warning'] = 'speeding_through_yellow'
+                    elif traffic_light_distance < 40.0 and speed > 50.0:
+                        # Penalize for approaching yellow too fast
+                        reward -= 0.5
+
+            # Handle stopped vehicle cases
+            if speed < 1.0:  # Almost stopped
+                # Check if there are obstacles or red lights that justify stopping
+                near_obstacle = nearest_same_lane_dist < 10.0
+                should_stop = near_obstacle or (approaching_red_light and traffic_light_distance < 20.0)
+
+                if should_stop:
+                    # It's good to stop for obstacles or red lights
                     reward += 1.0
+                    if approaching_red_light:
+                        info['stop_reason'] = 'red_light'
+                    else:
+                        info['stop_reason'] = 'obstacle'
                 else:
                     # No reason to stop
                     reward -= 0.5
@@ -621,14 +1016,15 @@ class CarEnv:
                         info['termination_reason'] = 'stuck'
             else:
                 self.stuck_time = 0
-                # Reward for moving at appropriate speed
-                speed_reward = -abs(speed - target_speed) / target_speed
-                reward += speed_reward
 
-            # Distance traveled reward
+            # Distance traveled reward - reduced when approaching red/yellow
             if self.last_location is not None:
                 distance_traveled = location.distance(self.last_location)
-                reward += distance_traveled * 0.5  # Reward for covering distance
+                # Reduce distance reward when approaching red light
+                if approaching_red_light and traffic_light_distance < 30.0:
+                    reward += distance_traveled * 0.1  # Reduced reward
+                else:
+                    reward += distance_traveled * 0.5  # Normal reward
 
             # Collision penalty
             if len(self.collision_hist) > 0:
@@ -636,18 +1032,28 @@ class CarEnv:
                 done = True
                 info['termination_reason'] = 'collision'
 
-            # Lane keeping reward
+            # Lane keeping is no longer RL's responsibility, but we'll track it for info
             waypoint = self.world.get_map().get_waypoint(location)
             distance_from_center = location.distance(waypoint.transform.location)
-            if distance_from_center < 1.0:
-                reward += 0.2
 
             # Store current location for next step
             self.last_location = location
 
+            # Add detailed information to info dictionary
             info['speed'] = speed
+            info['target_speed'] = target_speed
+            info['speed_diff'] = speed_diff
             info['reward'] = reward
             info['distance_from_center'] = distance_from_center
+
+            # Add traffic light info to debug info
+            info.update({
+                'red_light': approaching_red_light,
+                'yellow_light': approaching_yellow_light,
+                'green_light': approaching_green_light,
+                'traffic_light_distance': traffic_light_distance,
+                'nearest_obstacle_distance': nearest_same_lane_dist
+            })
 
             return reward, done, info
 
@@ -655,90 +1061,452 @@ class CarEnv:
             print(f"Error in calculate_reward: {e}")
             traceback.print_exc()
             return 0.0, True, {'error': str(e)}
+    
+    # def step(self, rl_action=None):
+    #     """Enhanced step function with improved spatial awareness and traffic light handling"""
+    #     try:
+    #         # 1. Get enhanced object detections first
+    #         detections = self.process_yolo_detection(self.front_camera)
+
+    #         # 2. Extract key safety information from detections
+    #         safety_info = self._analyze_safety(detections)
+
+    #         # 3. Determine control strategy
+    #         if self.vehicle and self.controller:
+    #             # Get standard MPC control (base behavior)
+    #             mpc_control = self.controller.get_control(self.vehicle, self.world)
+
+    #             # Default to MPC control
+    #             control = mpc_control
+    #             control_source = "MPC"
+
+    #             # Decide if we need to override with safety or traffic light controls
+    #             emergency_braking = safety_info['emergency_braking']
+    #             collision_avoidance = safety_info['collision_avoidance']
+    #             avoidance_steering = safety_info['avoidance_steering']
+
+    #             # Traffic light considerations
+    #             approaching_red_light = safety_info['approaching_red_light']
+    #             approaching_yellow_light = safety_info['approaching_yellow_light']
+    #             traffic_light_distance = safety_info['traffic_light_distance']
+
+    #             # Vehicle state
+    #             velocity = self.vehicle.get_velocity()
+    #             speed = 3.6 * math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)  # km/h
+
+    #             # Check if we need to stop for traffic light
+    #             stop_for_traffic_light = (approaching_red_light and traffic_light_distance < 30.0) or \
+    #                                      (approaching_yellow_light and traffic_light_distance < 15.0 and speed < 20.0)
+
+    #             # Add traffic light stopping to emergency braking conditions
+    #             if stop_for_traffic_light and traffic_light_distance < 20.0:
+    #                 emergency_braking = True
+    #                 control_source = "TRAFFIC_LIGHT_STOP"
+    #             # Add traffic light slowing to collision avoidance
+    #             elif stop_for_traffic_light:
+    #                 collision_avoidance = True
+    #                 control_source = "TRAFFIC_LIGHT_SLOW"
+
+    #             # If RL action is provided, use that for complex scenarios
+    #             if rl_action is not None and (collision_avoidance or avoidance_steering):
+    #                 # Convert RL action to control
+    #                 throttle = float(np.clip((rl_action[1] + 1) / 2, 0.0, 1.0))  # Convert from [-1,1] to [0,1]
+    #                 steer = float(np.clip(rl_action[0], -1.0, 1.0))
+
+    #                 # Current control for smooth transition
+    #                 current_control = self.vehicle.get_control()
+
+    #                 # Apply brake only when reducing speed
+    #                 brake = 0.0
+    #                 if throttle < current_control.throttle:
+    #                     brake = min((current_control.throttle - throttle) * 3.0, 1.0)
+
+    #                 # Create RL control
+    #                 control = carla.VehicleControl(
+    #                     throttle=throttle,
+    #                     steer=steer,
+    #                     brake=brake,
+    #                     hand_brake=False,
+    #                     reverse=False,
+    #                     manual_gear_shift=False
+    #                 )
+    #                 control_source = "RL"
+
+    #             # If emergency braking needed, override with hard braking
+    #             # This takes precedence over RL for safety
+    #             elif emergency_braking:
+    #                 # Emergency braking - override other controls
+    #                 control = carla.VehicleControl(
+    #                     throttle=0.0,
+    #                     steer=mpc_control.steer,  # Keep MPC steering
+    #                     brake=1.0,  # Full braking
+    #                     hand_brake=False,
+    #                     reverse=False,
+    #                     manual_gear_shift=False
+    #                 )
+
+    #                 # Update control source based on reason
+    #                 if stop_for_traffic_light and traffic_light_distance < 20.0:
+    #                     control_source = "TRAFFIC_LIGHT_EMERGENCY_STOP"
+    #                 else:
+    #                     control_source = "EMERGENCY_BRAKE"
+
+    #             # Traffic light gradual slowing (not emergency)
+    #             elif stop_for_traffic_light:
+    #                 # Calculate how much to slow based on distance to light
+    #                 brake_intensity = min(0.8, 20.0 / max(1.0, traffic_light_distance))
+    #                 throttle_reduction = min(0.9, traffic_light_distance / 50.0)
+
+    #                 control = carla.VehicleControl(
+    #                     throttle=mpc_control.throttle * throttle_reduction,
+    #                     steer=mpc_control.steer,
+    #                     brake=brake_intensity,
+    #                     hand_brake=False,
+    #                     reverse=False,
+    #                     manual_gear_shift=False
+    #                 )
+    #                 control_source = "TRAFFIC_LIGHT_SLOW"
+
+    #             # If we need to swerve and RL isn't handling it
+    #             elif avoidance_steering and rl_action is None:
+    #                 # Get current control and modify steering
+    #                 current_control = self.vehicle.get_control()
+    #                 steer_strength = safety_info['steer_amount']
+
+    #                 # Blend MPC steering with avoidance steering
+    #                 blended_steer = 0.3 * mpc_control.steer + 0.7 * steer_strength
+
+    #                 # Apply gentle braking during avoidance
+    #                 control = carla.VehicleControl(
+    #                     throttle=mpc_control.throttle * 0.6,  # Reduce throttle
+    #                     steer=blended_steer,
+    #                     brake=0.2,  # Light braking
+    #                     hand_brake=False,
+    #                     reverse=False,
+    #                     manual_gear_shift=False
+    #                 )
+    #                 control_source = "AVOIDANCE"
+
+    #             # Apply the final control
+    #             self.vehicle.apply_control(control)
+
+    #             # Store control values for info
+    #             control_info = {
+    #                 'throttle': control.throttle,
+    #                 'steer': control.steer,
+    #                 'brake': control.brake,
+    #                 'control_source': control_source,
+    #             }
+    #             control_info.update(safety_info)  # Add safety analysis data
+    #         else:
+    #             return None, 0, True, {'error': 'Vehicle or controller not available'}  
+
+    #         # Tick the world multiple times for better physics
+    #         for _ in range(4):
+    #             self.world.tick()   
+
+    #         # Get new state and calculate reward
+    #         new_state = self.get_state()
+    #         reward, done, info = self.calculate_reward()    
+
+    #         # Add control info for debugging
+    #         info.update(control_info)   
+
+    #         return new_state, reward, done, info    
+
+    #     except Exception as e:
+    #         print(f"Error in step: {e}")
+    #         traceback.print_exc()
+    #         return None, 0, True, {'error': str(e)}
 
     def step(self, rl_action=None):
-        """Execute step with hybrid MPC and RL control"""
+        """Enhanced step function with RL handling only throttle/brake and MPC handling steering"""
         try:
-            # Get control input from MPC (default behavior)
+            # 1. Get enhanced object detections first
+            detections = self.process_yolo_detection(self.front_camera)
+    
+            # 2. Extract key safety information from detections
+            safety_info = self._analyze_safety(detections)
+    
+            # 3. Determine control strategy
             if self.vehicle and self.controller:
+                # Get standard MPC control (base behavior)
                 mpc_control = self.controller.get_control(self.vehicle, self.world)
-
+    
                 # Default to MPC control
                 control = mpc_control
                 control_source = "MPC"
-
-                # Process YOLO detections to check for obstacles
-                detections = self.process_yolo_detection(self.front_camera)
-
-                # Check for nearby obstacles (vehicles, pedestrians, traffic signals)
-                nearby_obstacle = False
-                for obj in detections:
-                    # If object is close and is a vehicle, pedestrian, or traffic light
-                    if (obj['depth'] < 15.0 and 
-                        obj['class_name'] in ['car', 'truck', 'bus', 'person', 'traffic light']):
-                        nearby_obstacle = True
-                        break
+    
+                # Decide if we need to override with safety or traffic light controls
+                emergency_braking = safety_info['emergency_braking']
+                collision_avoidance = safety_info['collision_avoidance']
+                
+                # Traffic light considerations
+                approaching_red_light = safety_info['approaching_red_light']
+                approaching_yellow_light = safety_info['approaching_yellow_light']
+                traffic_light_distance = safety_info['traffic_light_distance']
+    
+                # Vehicle state
+                velocity = self.vehicle.get_velocity()
+                speed = 3.6 * math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)  # km/h
+    
+                # Check if we need to stop for traffic light
+                stop_for_traffic_light = (approaching_red_light and traffic_light_distance < 30.0) or \
+                                         (approaching_yellow_light and traffic_light_distance < 15.0 and speed < 20.0)
+    
+                # Add traffic light stopping to emergency braking conditions
+                if stop_for_traffic_light and traffic_light_distance < 20.0:
+                    emergency_braking = True
+                    control_source = "TRAFFIC_LIGHT_STOP"
+                # Add traffic light slowing to collision avoidance
+                elif stop_for_traffic_light:
+                    collision_avoidance = True
+                    control_source = "TRAFFIC_LIGHT_SLOW"
+    
+                # If RL action is provided, use it for speed control only
+                if rl_action is not None:
+                    # Convert RL action to throttle/brake
+                    # RL output is now a single value in range [-1, 1]
+                    rl_value = float(rl_action[0])  # Extract the single value
                     
-                # If we need to override with RL control
-                if nearby_obstacle and rl_action is not None:
-                    # Convert RL action to control
-                    throttle = float(np.clip((rl_action[1] + 1) / 2, 0.0, 1.0))  # Convert from [-1,1] to [0,1]
-                    steer = float(np.clip(rl_action[0], -1.0, 1.0))
-
-                    # Current control for smooth transition
-                    current_control = self.vehicle.get_control()
-
-                    # Smooth control changes (more aggressive than normal since this is override)
-                    smooth_throttle = 0.6 * current_control.throttle + 0.4 * throttle
-                    smooth_steer = 0.6 * current_control.steer + 0.4 * steer
-
-                    # Apply brake only when reducing speed (more aggressive for emergency)
+                    # Always use MPC for steering
+                    steer = mpc_control.steer
+                    
+                    # Convert RL output to throttle/brake
+                    throttle = 0.0
                     brake = 0.0
-                    if throttle < current_control.throttle:
-                        brake = min((current_control.throttle - throttle) * 3.0, 1.0)
-
-                    # Create RL control
+                    
+                    if rl_value >= 0:  # Positive values control throttle
+                        throttle = float(np.clip(rl_value, 0.0, 1.0))
+                    else:  # Negative values control brake
+                        brake = float(np.clip(-rl_value, 0.0, 1.0))
+                    
+                    # Create control with RL throttle/brake and MPC steering
                     control = carla.VehicleControl(
-                        throttle=smooth_throttle,
-                        steer=smooth_steer,
+                        throttle=throttle,
+                        steer=steer,  # Always use MPC steering
                         brake=brake,
                         hand_brake=False,
                         reverse=False,
                         manual_gear_shift=False
                     )
-                    control_source = "RL"
-
-                # Apply the final control (either MPC or RL)
+                    control_source = "RL_SPEED_MPC_STEER"
+    
+                # If emergency braking needed, override with hard braking
+                # This takes precedence over RL for safety
+                elif emergency_braking:
+                    # Emergency braking - override other controls but keep MPC steering
+                    control = carla.VehicleControl(
+                        throttle=0.0,
+                        steer=mpc_control.steer,  # Keep MPC steering
+                        brake=1.0,  # Full braking
+                        hand_brake=False,
+                        reverse=False,
+                        manual_gear_shift=False
+                    )
+    
+                    # Update control source based on reason
+                    if stop_for_traffic_light and traffic_light_distance < 20.0:
+                        control_source = "TRAFFIC_LIGHT_EMERGENCY_STOP"
+                    else:
+                        control_source = "EMERGENCY_BRAKE"
+    
+                # Traffic light gradual slowing (not emergency)
+                elif stop_for_traffic_light:
+                    # Calculate how much to slow based on distance to light
+                    brake_intensity = min(0.8, 20.0 / max(1.0, traffic_light_distance))
+                    throttle_reduction = min(0.9, traffic_light_distance / 50.0)
+    
+                    control = carla.VehicleControl(
+                        throttle=mpc_control.throttle * throttle_reduction,
+                        steer=mpc_control.steer,  # Always use MPC steering
+                        brake=brake_intensity,
+                        hand_brake=False,
+                        reverse=False,
+                        manual_gear_shift=False
+                    )
+                    control_source = "TRAFFIC_LIGHT_SLOW"
+    
+                # In all other cases, use MPC control directly
+                else:
+                    control = mpc_control
+                    control_source = "MPC"
+    
+                # Apply the final control
                 self.vehicle.apply_control(control)
-
-                # Store current control values for info
+    
+                # Store control values for info
                 control_info = {
                     'throttle': control.throttle,
                     'steer': control.steer,
                     'brake': control.brake,
                     'control_source': control_source,
-                    'nearby_obstacle': nearby_obstacle
                 }
+                control_info.update(safety_info)  # Add safety analysis data
             else:
-                return None, 0, True, {'error': 'Vehicle or controller not available'}
-
+                return None, 0, True, {'error': 'Vehicle or controller not available'}  
+    
             # Tick the world multiple times for better physics
             for _ in range(4):
-                self.world.tick()
-
+                self.world.tick()   
+    
             # Get new state and calculate reward
             new_state = self.get_state()
-            reward, done, info = self.calculate_reward()
-
+            reward, done, info = self.calculate_reward()    
+    
             # Add control info for debugging
-            info.update(control_info)
-
-            return new_state, reward, done, info
-
+            info.update(control_info)   
+    
+            return new_state, reward, done, info    
+    
         except Exception as e:
             print(f"Error in step: {e}")
             traceback.print_exc()
             return None, 0, True, {'error': str(e)}
+
+    def _analyze_safety(self, detections):
+        """Analyze detections to determine safety-critical information for control"""
+        # Get vehicle velocity
+        velocity = self.vehicle.get_velocity()
+        speed = 3.6 * math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)  # km/h
+
+        # Initialize safety flags
+        emergency_braking = False
+        collision_avoidance = False
+        avoidance_steering = False
+        steer_amount = 0.0
+
+        # Traffic light specific flags
+        approaching_red_light = False
+        approaching_yellow_light = False
+        approaching_green_light = False
+        traffic_light_distance = float('inf')
+
+        # Initialize distances
+        nearest_same_lane_dist = float('inf')
+        nearest_left_lane_dist = float('inf')
+        nearest_right_lane_dist = float('inf')
+        min_ttc = float('inf')
+
+        # Important object classes for driving
+        vehicle_classes = ['car', 'truck', 'bus', 'motorcycle', 'bicycle']
+        critical_classes = ['person'] + vehicle_classes
+        traffic_signals = ['stop sign']  # Removed traffic light as we handle it separately now
+
+        # Analyze each detection
+        for obj in detections:
+            obj_depth = obj['depth']
+            obj_lane = obj['lane_position']
+            obj_angle = obj['relative_angle']
+            obj_ttc = obj['time_to_collision']
+            obj_class = obj['class_name']
+
+            # Process traffic lights specifically
+            if "traffic_light" in obj_class and abs(obj_angle) < 30 and obj_depth < 50.0:
+                traffic_light_color = obj.get('traffic_light_color')
+
+                if traffic_light_color and obj_depth < traffic_light_distance:
+                    traffic_light_distance = obj_depth
+
+                    if traffic_light_color == "red":
+                        approaching_red_light = True
+                        # Emergency braking for close red lights when moving at speed
+                        if obj_depth < 15.0 and speed > 10.0:
+                            emergency_braking = True
+                        # Regular braking for red lights
+                        elif obj_depth < 30.0:
+                            collision_avoidance = True
+
+                    elif traffic_light_color == "yellow":
+                        approaching_yellow_light = True
+                        # Decision based on distance: brake if close, proceed if far
+                        if obj_depth < 20.0 and speed > 30.0:
+                            collision_avoidance = True  # Slow down for yellow
+
+                    elif traffic_light_color == "green":
+                        approaching_green_light = True
+                        # No special action needed for green
+
+                continue  # Skip the standard processing for traffic lights
+
+            # Update nearest distances by lane
+            if obj_class in critical_classes:
+                if obj_lane == 0:  # Same lane
+                    nearest_same_lane_dist = min(nearest_same_lane_dist, obj_depth)
+                elif obj_lane == -1:  # Left lane
+                    nearest_left_lane_dist = min(nearest_left_lane_dist, obj_depth)
+                elif obj_lane == 1:  # Right lane
+                    nearest_right_lane_dist = min(nearest_right_lane_dist, obj_depth)
+
+                # Update minimum time-to-collision for objects in our path
+                if abs(obj_angle) < 30 and obj_ttc < min_ttc:
+                    min_ttc = obj_ttc
+
+            # Pedestrian checks (highest priority)
+            if obj_class == 'person' and obj_depth < 15 and abs(obj_angle) < 45:
+                emergency_braking = True
+
+            # Vehicle collision checks
+            elif obj_class in vehicle_classes:
+                # Same lane checks
+                if obj_lane == 0 and abs(obj_angle) < 30:
+                    # Emergency braking condition - close vehicle in same lane
+                    if obj_ttc < 2.0 or obj_depth < 5.0:
+                        emergency_braking = True
+                    # Collision avoidance - vehicle in our lane but not imminent emergency
+                    elif obj_ttc < 6.0 or obj_depth < 15.0:
+                        collision_avoidance = True
+
+                        # Determine if we should steer to avoid
+                        if speed > 5.0 and obj_depth > 8.0:
+                            avoidance_steering = True
+
+                            # Decide which way to steer based on adjacent lane distances
+                            if nearest_left_lane_dist > nearest_right_lane_dist and nearest_left_lane_dist > obj_depth:
+                                steer_amount = -0.5  # Steer left
+                            elif nearest_right_lane_dist > obj_depth:
+                                steer_amount = 0.5   # Steer right
+
+                # Adjacent lane - vehicle cutting in
+                elif obj_depth < 10.0 and abs(obj_angle) < 40:
+                    collision_avoidance = True
+
+                    # Light steering away from adjacent vehicle
+                    if speed > 10.0:
+                        avoidance_steering = True
+                        steer_amount = 0.2 if obj_angle < 0 else -0.2  # Steer away slightly
+
+            # Other traffic signal checks
+            elif obj_class in traffic_signals and obj_depth < 25.0 and abs(obj_angle) < 20:
+                collision_avoidance = True
+
+        # Calculate nearest_cross_lane_dist as the minimum of adjacent lane distances
+        nearest_cross_lane_dist = min(nearest_left_lane_dist, nearest_right_lane_dist)
+        if nearest_cross_lane_dist == float('inf'):
+            nearest_cross_lane_dist = 100.0
+    
+        # Handle other infinite distances
+        if nearest_same_lane_dist == float('inf'):
+            nearest_same_lane_dist = 100.0
+        if min_ttc == float('inf'):
+            min_ttc = 100.0
+    
+        # Return comprehensive safety information
+        return {
+            'emergency_braking': emergency_braking,
+            'collision_avoidance': collision_avoidance,
+            'avoidance_steering': avoidance_steering,
+            'steer_amount': steer_amount,
+            'nearest_same_lane_dist': nearest_same_lane_dist,
+            'nearest_left_lane_dist': nearest_left_lane_dist,
+            'nearest_right_lane_dist': nearest_right_lane_dist,
+            'nearest_cross_lane_dist': nearest_cross_lane_dist,  # Added
+            'min_ttc': min_ttc,
+            'approaching_red_light': approaching_red_light,
+            'approaching_yellow_light': approaching_yellow_light,
+            'approaching_green_light': approaching_green_light,
+            'traffic_light_distance': traffic_light_distance
+        }
 
     def run(self):
         """Main game loop using MPC controller"""
@@ -987,18 +1755,4 @@ class CarEnv:
             print(f"Error closing environment: {e}")
             traceback.print_exc()
     
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
