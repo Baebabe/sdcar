@@ -1,0 +1,1 @@
+{"episode_rewards": [-67.97352224810615], "episode_lengths": [16], "mpc_usage": [4], "ppo_usage": [12], "collisions": [0], "mpc_failures": [16], "best_reward": -52.33130766871129, "last_save_time": 1738234630.1258643, "total_steps": 18}
