@@ -745,32 +745,43 @@ class TrainingMonitorCallback(BaseCallback):
                 # Extract metrics from the environment
                 env_idx = i if self.model.env.num_envs > 1 else 0
                 env = self.training_env.envs[env_idx].env
-                
+
                 if hasattr(env, 'metrics'):
                     # Calculate episode metrics
                     avg_speed = np.mean(env.metrics['speeds']) if env.metrics['speeds'] else 0
                     max_lane_dev = max(env.metrics['lane_deviations']) if env.metrics['lane_deviations'] else 0
-                    
+
                     # Store metrics
                     self.training_metrics['episode_rewards'].append(env.episode_reward)
                     self.training_metrics['episode_lengths'].append(env.episode_length)
                     self.training_metrics['avg_speeds'].append(avg_speed)
                     self.training_metrics['collisions'].append(env.metrics['collisions'])
                     self.training_metrics['lane_deviations'].append(max_lane_dev)
-                    
+
                     # Log to tensorboard
                     self.logger.record('env/episode_reward', env.episode_reward)
                     self.logger.record('env/episode_length', env.episode_length)
                     self.logger.record('env/average_speed', avg_speed)
                     self.logger.record('env/collisions', env.metrics['collisions'])
                     self.logger.record('env/max_lane_deviation', max_lane_dev)
-                    
+
                     # Log training speed
                     elapsed_time = time.time() - self.start_time
                     fps = int(self.num_timesteps / elapsed_time)
                     self.logger.record('time/fps', fps)
-        
+
+                    # Print episode summary to console
+                    print(f"\n=== Episode Complete ===")
+                    print(f"Episode Reward: {env.episode_reward:.2f}")
+                    print(f"Episode Length: {env.episode_length}")
+                    print(f"Average Speed: {avg_speed:.2f} km/h")
+                    print(f"Collisions: {env.metrics['collisions']}")
+                    print(f"Max Lane Deviation: {max_lane_dev:.2f} m")
+                    print(f"Training FPS: {fps}")
+                    print(f"========================\n")
+
         return True
+
     
     def save_metrics(self, path):
         """Save training metrics to a file"""

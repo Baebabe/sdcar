@@ -1219,8 +1219,158 @@ class CarEnv:
     #         traceback.print_exc()
     #         return None, 0, True, {'error': str(e)}
 
+
+
+
+
+
+    # def step(self, rl_action=None):
+    #     """Enhanced step function with RL handling only throttle/brake and MPC handling steering"""
+    #     try:
+    #         # 1. Get enhanced object detections first
+    #         detections = self.process_yolo_detection(self.front_camera)
+    
+    #         # 2. Extract key safety information from detections
+    #         safety_info = self._analyze_safety(detections)
+    
+    #         # 3. Determine control strategy
+    #         if self.vehicle and self.controller:
+    #             # Get standard MPC control (base behavior)
+    #             mpc_control = self.controller.get_control(self.vehicle, self.world)
+    
+    #             # Default to MPC control
+    #             control = mpc_control
+    #             control_source = "MPC"
+    
+    #             # Decide if we need to override with safety or traffic light controls
+    #             emergency_braking = safety_info['emergency_braking']
+    #             collision_avoidance = safety_info['collision_avoidance']
+                
+    #             # Traffic light considerations
+    #             approaching_red_light = safety_info['approaching_red_light']
+    #             approaching_yellow_light = safety_info['approaching_yellow_light']
+    #             traffic_light_distance = safety_info['traffic_light_distance']
+    
+    #             # Vehicle state
+    #             velocity = self.vehicle.get_velocity()
+    #             speed = 3.6 * math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)  # km/h
+    
+    #             # Check if we need to stop for traffic light
+    #             stop_for_traffic_light = (approaching_red_light and traffic_light_distance < 30.0) or \
+    #                                      (approaching_yellow_light and traffic_light_distance < 15.0 and speed < 20.0)
+    
+    #             # Add traffic light stopping to emergency braking conditions
+    #             if stop_for_traffic_light and traffic_light_distance < 20.0:
+    #                 emergency_braking = True
+    #                 control_source = "TRAFFIC_LIGHT_STOP"
+    #             # Add traffic light slowing to collision avoidance
+    #             elif stop_for_traffic_light:
+    #                 collision_avoidance = True
+    #                 control_source = "TRAFFIC_LIGHT_SLOW"
+    
+    #             # If RL action is provided, use it for speed control only
+    #             if rl_action is not None:
+    #                 # Convert RL action to throttle/brake
+    #                 # RL output is now a single value in range [-1, 1]
+    #                 rl_value = float(rl_action[0])  # Extract the single value
+                    
+    #                 # Always use MPC for steering
+    #                 steer = mpc_control.steer
+                    
+    #                 # Convert RL output to throttle/brake
+    #                 throttle = 0.0
+    #                 brake = 0.0
+                    
+    #                 if rl_value >= 0:  # Positive values control throttle
+    #                     throttle = float(np.clip(rl_value, 0.0, 1.0))
+    #                 else:  # Negative values control brake
+    #                     brake = float(np.clip(-rl_value, 0.0, 1.0))
+                    
+    #                 # Create control with RL throttle/brake and MPC steering
+    #                 control = carla.VehicleControl(
+    #                     throttle=throttle,
+    #                     steer=steer,  # Always use MPC steering
+    #                     brake=brake,
+    #                     hand_brake=False,
+    #                     reverse=False,
+    #                     manual_gear_shift=False
+    #                 )
+    #                 control_source = "RL_SPEED_MPC_STEER"
+    
+    #             # If emergency braking needed, override with hard braking
+    #             # This takes precedence over RL for safety
+    #             elif emergency_braking:
+    #                 # Emergency braking - override other controls but keep MPC steering
+    #                 control = carla.VehicleControl(
+    #                     throttle=0.0,
+    #                     steer=mpc_control.steer,  # Keep MPC steering
+    #                     brake=1.0,  # Full braking
+    #                     hand_brake=False,
+    #                     reverse=False,
+    #                     manual_gear_shift=False
+    #                 )
+    
+    #                 # Update control source based on reason
+    #                 if stop_for_traffic_light and traffic_light_distance < 20.0:
+    #                     control_source = "TRAFFIC_LIGHT_EMERGENCY_STOP"
+    #                 else:
+    #                     control_source = "EMERGENCY_BRAKE"
+    
+    #             # Traffic light gradual slowing (not emergency)
+    #             elif stop_for_traffic_light:
+    #                 # Calculate how much to slow based on distance to light
+    #                 brake_intensity = min(0.8, 20.0 / max(1.0, traffic_light_distance))
+    #                 throttle_reduction = min(0.9, traffic_light_distance / 50.0)
+    
+    #                 control = carla.VehicleControl(
+    #                     throttle=mpc_control.throttle * throttle_reduction,
+    #                     steer=mpc_control.steer,  # Always use MPC steering
+    #                     brake=brake_intensity,
+    #                     hand_brake=False,
+    #                     reverse=False,
+    #                     manual_gear_shift=False
+    #                 )
+    #                 control_source = "TRAFFIC_LIGHT_SLOW"
+    
+    #             # In all other cases, use MPC control directly
+    #             else:
+    #                 control = mpc_control
+    #                 control_source = "MPC"
+    
+    #             # Apply the final control
+    #             self.vehicle.apply_control(control)
+    
+    #             # Store control values for info
+    #             control_info = {
+    #                 'throttle': control.throttle,
+    #                 'steer': control.steer,
+    #                 'brake': control.brake,
+    #                 'control_source': control_source,
+    #             }
+    #             control_info.update(safety_info)  # Add safety analysis data
+    #         else:
+    #             return None, 0, True, {'error': 'Vehicle or controller not available'}  
+    
+    #         # Tick the world multiple times for better physics
+    #         for _ in range(4):
+    #             self.world.tick()   
+    
+    #         # Get new state and calculate reward
+    #         new_state = self.get_state()
+    #         reward, done, info = self.calculate_reward()    
+    
+    #         # Add control info for debugging
+    #         info.update(control_info)   
+    
+    #         return new_state, reward, done, info    
+    
+    #     except Exception as e:
+    #         print(f"Error in step: {e}")
+    #         traceback.print_exc()
+    #         return None, 0, True, {'error': str(e)}
+
     def step(self, rl_action=None):
-        """Enhanced step function with RL handling only throttle/brake and MPC handling steering"""
+        """Hybrid control with MPC for normal driving and RL for complex scenarios"""
         try:
             # 1. Get enhanced object detections first
             detections = self.process_yolo_detection(self.front_camera)
@@ -1228,133 +1378,86 @@ class CarEnv:
             # 2. Extract key safety information from detections
             safety_info = self._analyze_safety(detections)
     
-            # 3. Determine control strategy
-            if self.vehicle and self.controller:
-                # Get standard MPC control (base behavior)
-                mpc_control = self.controller.get_control(self.vehicle, self.world)
+            # 3. Determine if environment is complex (obstacles, traffic lights)
+            complex_environment = (
+                safety_info['approaching_red_light'] or 
+                safety_info['approaching_yellow_light'] or
+                safety_info['approaching_green_light'] or  # Include green for consistency
+                safety_info['nearest_same_lane_dist'] < 50.0 or  # Vehicle ahead within 50m
+                safety_info['nearest_cross_lane_dist'] < 20.0 or  # Cross traffic within 20m
+                safety_info['emergency_braking'] or 
+                safety_info['collision_avoidance']
+            )
     
-                # Default to MPC control
-                control = mpc_control
-                control_source = "MPC"
-    
-                # Decide if we need to override with safety or traffic light controls
-                emergency_braking = safety_info['emergency_braking']
-                collision_avoidance = safety_info['collision_avoidance']
+            # 4. Get MPC control (base behavior)
+            mpc_control = self.controller.get_control(self.vehicle, self.world)
+            
+            # 5. Default control setup
+            control = mpc_control  # Start with MPC as default
+            control_source = "MPC_FULL"
+            
+            # Emergency override takes highest priority regardless of mode
+            emergency_braking = safety_info['emergency_braking']
+            if emergency_braking:
+                control = carla.VehicleControl(
+                    throttle=0.0,
+                    steer=mpc_control.steer,  # Keep MPC steering
+                    brake=1.0,  # Full braking
+                    hand_brake=False,
+                    reverse=False,
+                    manual_gear_shift=False
+                )
+                control_source = "EMERGENCY_BRAKE"
+            
+            # If in complex environment, use RL for throttle/brake
+            elif complex_environment and rl_action is not None:
+                # Convert RL action to throttle/brake
+                rl_value = float(rl_action[0])
                 
-                # Traffic light considerations
-                approaching_red_light = safety_info['approaching_red_light']
-                approaching_yellow_light = safety_info['approaching_yellow_light']
-                traffic_light_distance = safety_info['traffic_light_distance']
-    
-                # Vehicle state
-                velocity = self.vehicle.get_velocity()
-                speed = 3.6 * math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)  # km/h
-    
-                # Check if we need to stop for traffic light
-                stop_for_traffic_light = (approaching_red_light and traffic_light_distance < 30.0) or \
-                                         (approaching_yellow_light and traffic_light_distance < 15.0 and speed < 20.0)
-    
-                # Add traffic light stopping to emergency braking conditions
-                if stop_for_traffic_light and traffic_light_distance < 20.0:
-                    emergency_braking = True
-                    control_source = "TRAFFIC_LIGHT_STOP"
-                # Add traffic light slowing to collision avoidance
-                elif stop_for_traffic_light:
-                    collision_avoidance = True
-                    control_source = "TRAFFIC_LIGHT_SLOW"
-    
-                # If RL action is provided, use it for speed control only
-                if rl_action is not None:
-                    # Convert RL action to throttle/brake
-                    # RL output is now a single value in range [-1, 1]
-                    rl_value = float(rl_action[0])  # Extract the single value
-                    
-                    # Always use MPC for steering
-                    steer = mpc_control.steer
-                    
-                    # Convert RL output to throttle/brake
-                    throttle = 0.0
-                    brake = 0.0
-                    
-                    if rl_value >= 0:  # Positive values control throttle
-                        throttle = float(np.clip(rl_value, 0.0, 1.0))
-                    else:  # Negative values control brake
-                        brake = float(np.clip(-rl_value, 0.0, 1.0))
-                    
-                    # Create control with RL throttle/brake and MPC steering
-                    control = carla.VehicleControl(
-                        throttle=throttle,
-                        steer=steer,  # Always use MPC steering
-                        brake=brake,
-                        hand_brake=False,
-                        reverse=False,
-                        manual_gear_shift=False
-                    )
-                    control_source = "RL_SPEED_MPC_STEER"
-    
-                # If emergency braking needed, override with hard braking
-                # This takes precedence over RL for safety
-                elif emergency_braking:
-                    # Emergency braking - override other controls but keep MPC steering
-                    control = carla.VehicleControl(
-                        throttle=0.0,
-                        steer=mpc_control.steer,  # Keep MPC steering
-                        brake=1.0,  # Full braking
-                        hand_brake=False,
-                        reverse=False,
-                        manual_gear_shift=False
-                    )
-    
-                    # Update control source based on reason
-                    if stop_for_traffic_light and traffic_light_distance < 20.0:
-                        control_source = "TRAFFIC_LIGHT_EMERGENCY_STOP"
-                    else:
-                        control_source = "EMERGENCY_BRAKE"
-    
-                # Traffic light gradual slowing (not emergency)
-                elif stop_for_traffic_light:
-                    # Calculate how much to slow based on distance to light
-                    brake_intensity = min(0.8, 20.0 / max(1.0, traffic_light_distance))
-                    throttle_reduction = min(0.9, traffic_light_distance / 50.0)
-    
-                    control = carla.VehicleControl(
-                        throttle=mpc_control.throttle * throttle_reduction,
-                        steer=mpc_control.steer,  # Always use MPC steering
-                        brake=brake_intensity,
-                        hand_brake=False,
-                        reverse=False,
-                        manual_gear_shift=False
-                    )
-                    control_source = "TRAFFIC_LIGHT_SLOW"
-    
-                # In all other cases, use MPC control directly
-                else:
-                    control = mpc_control
-                    control_source = "MPC"
-    
-                # Apply the final control
-                self.vehicle.apply_control(control)
-    
-                # Store control values for info
-                control_info = {
-                    'throttle': control.throttle,
-                    'steer': control.steer,
-                    'brake': control.brake,
-                    'control_source': control_source,
-                }
-                control_info.update(safety_info)  # Add safety analysis data
+                throttle = 0.0
+                brake = 0.0
+                
+                if rl_value >= 0:  # Positive values control throttle
+                    throttle = float(np.clip(rl_value, 0.0, 1.0))
+                else:  # Negative values control brake
+                    brake = float(np.clip(-rl_value, 0.0, 1.0))
+                
+                # Create hybrid control with RL throttle/brake and MPC steering
+                control = carla.VehicleControl(
+                    throttle=throttle,
+                    steer=mpc_control.steer,  # Always use MPC steering
+                    brake=brake,
+                    hand_brake=False,
+                    reverse=False,
+                    manual_gear_shift=False
+                )
+                control_source = "RL_THROTTLE_MPC_STEER"
+            
+            # If environment is clear, use full MPC control
             else:
-                return None, 0, True, {'error': 'Vehicle or controller not available'}  
+                control = mpc_control
+                control_source = "MPC_FULL"
+            
+            # Apply the final control
+            self.vehicle.apply_control(control)
     
-            # Tick the world multiple times for better physics
+            # Store control values and environment state for info
+            control_info = {
+                'throttle': control.throttle,
+                'steer': control.steer,
+                'brake': control.brake,
+                'control_source': control_source,
+                'complex_environment': complex_environment
+            }
+            control_info.update(safety_info)  # Add safety analysis data
+            
+            # Continue with physics, reward calculation, etc.
             for _ in range(4):
                 self.world.tick()   
     
-            # Get new state and calculate reward
             new_state = self.get_state()
             reward, done, info = self.calculate_reward()    
     
-            # Add control info for debugging
             info.update(control_info)   
     
             return new_state, reward, done, info    
